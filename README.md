@@ -20,6 +20,18 @@
 npm install
 ```
 
+### 安装 webcrack（可选但推荐）
+
+webcrack 是一个强大的 JavaScript 反混淆工具，可以与 webfunny_dejs 配合使用。
+
+```bash
+# 使用 npm 全局安装
+npm install -g webcrack
+
+# 或使用 npx（推荐，无需安装）
+npx webcrack your_script.js
+```
+
 ### 使用方法
 
 ```bash
@@ -52,6 +64,75 @@ node de.js -f input.js --function-name "f\\d+"
 | `--function-name` | | 指定要调试的函数名称（正则表达式） | 所有匹配 |
 | `--min-args` | | 最小参数个数 | 4 |
 | `--max-args` | | 最大参数个数 | 6 |
+
+## 其他工具集成
+
+### webcrack 集成使用
+
+webcrack 是一个强大的 JavaScript 反混淆工具，可以作为 webfunny_dejs 的前置处理步骤，显著提高反混淆效果。
+
+#### 安装 webcrack
+
+```bash
+# 使用 npm 全局安装
+npm install -g webcrack
+
+# 或使用 npx（推荐，无需安装）
+npx webcrack your_script.js
+```
+
+#### 使用 webcrack 进行预处理
+
+```bash
+# 1. 首先使用 webcrack 进行初步反混淆
+webcrack input.js -o intermediate.js
+
+# 2. 然后使用 webfunny_dejs 进行深度分析
+node de.js -f intermediate.js -o output.js
+
+# 或使用单行命令组合
+webcrack input.js -o intermediate.js && node de.js -f intermediate.js -o output.js
+```
+
+#### webcrack 主要功能
+
+- 🔍 **AST 解混淆** - 还原压缩的变量名和函数名
+- 🔄 **控制流平坦化** - 还原复杂的控制流结构
+- 💡 **常量传播** - 还原常量表达式
+- 🧩 **字符串解密** - 解密加密的字符串
+- 📊 **代码美化** - 格式化代码结构
+
+#### webcrack 与 webfunny_dejs 配合使用的工作流程
+
+```bash
+# 完整反混淆流程
+webcrack encrypted.js -o step1.js                    # 初步解混淆
+node de.js -f step1.js -o step2.js -v -d             # 运行时函数解密
+webcrack step2.js -o final.js --beautify            # 最终美化
+```
+
+#### webcrack 常用参数
+
+```bash
+# 基本用法
+webcrack input.js -o output.js
+
+# 美化输出
+webcrack input.js -o output.js --beautify
+
+# 解混淆特定模式
+webcrack input.js -o output.js --string-array
+
+# 详细模式
+webcrack input.js -o output.js --verbose
+```
+
+### 工具对比
+
+| 工具 | 主要功能 | 适用场景 |
+|------|----------|----------|
+| **webfunny_dejs** | 运行时函数解密、常量替换、依赖分析 | 处理复杂的运行时加密函数 |
+| **webcrack** | AST解混淆、控制流还原、字符串解密 | 处理压缩和混淆的结构化代码 |
 
 ## 工作原理
 
