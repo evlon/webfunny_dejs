@@ -3,14 +3,15 @@
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
-const yargs = require('yargs');
+const yargs = require('yargs/yargs');
+const { hideBin } = require('yargs/helpers');
 const parser = require('@babel/parser');
 const traverse = require('@babel/traverse').default;
 const generate = require('@babel/generator').default;
 const t = require('@babel/types');
 
 // 命令行参数解析
-const argv = yargs
+const argv = yargs(hideBin(process.argv))
   .option('file', {
     alias: 'f',
     describe: '待处理的文件路径',
@@ -77,7 +78,7 @@ const argv = yargs
   .option('intercept-pattern', {
     describe: '函数名匹配模式（正则表达式）',
     type: 'string',
-    default: 'f\\d+'
+    default: 'f\\d*'
   })
   .option('min-args', {
     describe: '最小参数个数',
@@ -117,9 +118,18 @@ function shouldInterceptFunction(funcName, argsCount) {
     return false;
   }
   
-  return config.interceptPattern.test(funcName) && 
-         argsCount >= config.minArgs && 
-         argsCount <= config.maxArgs;
+  // 检查是否匹配拦截模式
+  if (!config.interceptPattern.test(funcName)) {
+    return false;
+  }
+  
+  // 放宽参数数量限制：如果函数是重要依赖，即使参数数量不符合也要提取
+  // 记录所有匹配拦截模式的函数，无论参数数量
+  if (config.verbose && (argsCount < config.minArgs || argsCount > config.maxArgs)) {
+    console.log(`  [放宽限制] 函数 ${funcName} 参数数量 ${argsCount} 不符合要求 (${config.minArgs}-${config.maxArgs})，但因为匹配模式仍被提取`);
+  }
+  
+  return true;
 }
 
 /**
@@ -175,7 +185,7 @@ function preprocessCode(code) {
 }
 
 /**
- * 收集初始化函数中调用的函数
+ * 收集初始化函数中调用的所有函数（包括嵌套依赖）
  * @param {string} code - 源代码
  * @returns {Set} - 初始化函数中调用的函数名集合
  */
@@ -204,13 +214,110 @@ function collectInitializationFunctionCalls(code) {
         }
       }
     });
+
+    // 递归分析依赖关系
+    let hasNewDependencies = true;
+    while (hasNewDependencies) {
+      hasNewDependencies = false;
+      const currentCalls = new Set(initializationCalls);
+      
+      traverse(ast, {
+        FunctionDeclaration(path) {
+          const funcName = path.node.id?.name;
+          if (funcName && currentCalls.has(funcName)) {
+            // 分析这个函数内部调用的其他函数
+            traverse(path.node, {
+              CallExpression(innerPath) {
+                const calledFuncName = extractFunctionName(innerPath.node.callee);
+                if (calledFuncName && config.interceptPattern.test(calledFuncName)) {
+                  if (!initializationCalls.has(calledFuncName)) {
+                    initializationCalls.add(calledFuncName);
+                    hasNewDependencies = true;
+                    if (config.verbose) {
+                      console.log(`  [嵌套依赖] ${funcName} 调用 ${calledFuncName}`);
+                    }
+                  }
+                }
+              }
+            }, path.scope);
+          }
+        },
+        
+        VariableDeclarator(path) {
+          if (path.node.init && path.node.init.type === 'FunctionExpression') {
+            const funcName = path.node.id?.name;
+            if (funcName && currentCalls.has(funcName)) {
+              // 分析函数表达式内部调用的其他函数
+              traverse(path.node.init, {
+                CallExpression(innerPath) {
+                  const calledFuncName = extractFunctionName(innerPath.node.callee);
+                  if (calledFuncName && config.interceptPattern.test(calledFuncName)) {
+                    if (!initializationCalls.has(calledFuncName)) {
+                      initializationCalls.add(calledFuncName);
+                      hasNewDependencies = true;
+                      if (config.verbose) {
+                        console.log(`  [嵌套依赖] ${funcName} 调用 ${calledFuncName}`);
+                      }
+                    }
+                  }
+                }
+              }, path.scope);
+            }
+          }
+        }
+      });
+    }
   } catch (error) {
     if (config.verbose) {
       console.log(`  [警告] 收集初始化函数调用失败: ${error.message}`);
     }
   }
   
+  if (config.verbose && initializationCalls.size > 0) {
+    console.log(`  [依赖分析完成] 共找到 ${initializationCalls.size} 个依赖函数: ${Array.from(initializationCalls).join(', ')}`);
+  }
+  
   return initializationCalls;
+}
+
+/**
+ * 拓扑排序算法
+ * @param {Map} graph - 依赖图，key为函数名，value为依赖的函数名集合
+ * @returns {Array} - 拓扑排序后的函数名数组
+ */
+function topologicalSort(graph) {
+  const visited = new Set();
+  const visiting = new Set();
+  const result = [];
+  
+  function visit(node) {
+    if (visiting.has(node)) {
+      throw new Error(`发现循环依赖: ${node}`);
+    }
+    
+    if (!visited.has(node)) {
+      visiting.add(node);
+      
+      // 先访问所有依赖节点
+      const dependencies = graph.get(node) || new Set();
+      for (const dep of dependencies) {
+        if (graph.has(dep)) {
+          visit(dep);
+        }
+      }
+      
+      visiting.delete(node);
+      visited.add(node);
+      result.push(node);
+    }
+  }
+  
+  // 对图中的每个节点进行排序
+  for (const node of graph.keys()) {
+    visit(node);
+  }
+  
+  return result;
 }
 
 /**
@@ -230,7 +337,7 @@ function extractFunctionDefinitions(code) {
     const functionCodeMap = new Map();
     const functionNames = new Set();
 
-    // 先收集所有匹配的函数
+    // 先收集所有匹配的函数，不限制参数数量（因为依赖关系更重要）
     traverse(ast, {
       FunctionDeclaration(path) {
         const funcName = path.node.id?.name;
@@ -241,6 +348,9 @@ function extractFunctionDefinitions(code) {
             type: 'declaration'
           });
           functionNames.add(funcName);
+          if (config.verbose) {
+            console.log(`  [收集] 函数声明: ${funcName}`);
+          }
         }
       },
       
@@ -254,6 +364,9 @@ function extractFunctionDefinitions(code) {
               type: 'expression'
             });
             functionNames.add(funcName);
+            if (config.verbose) {
+              console.log(`  [收集] 函数表达式: ${funcName}`);
+            }
           }
         }
       }
@@ -262,45 +375,72 @@ function extractFunctionDefinitions(code) {
     // 收集初始化函数中调用的函数
     const initializationCalls = collectInitializationFunctionCalls(code);
     
-    // 确保初始化函数调用的函数也被提取（即使它们自身可能不符合拦截模式）
-    traverse(ast, {
-      FunctionDeclaration(path) {
-        const funcName = path.node.id?.name;
-        if (funcName && initializationCalls.has(funcName) && !functionNames.has(funcName)) {
-          allFunctions.push({
-            name: funcName,
-            node: path.node,
-            type: 'declaration'
-          });
-          functionNames.add(funcName);
-          if (config.verbose) {
-            console.log(`  [补充提取] 初始化依赖函数: ${funcName}`);
-          }
-        }
-      },
-      
-      VariableDeclarator(path) {
-        if (path.node.init && path.node.init.type === 'FunctionExpression') {
-          const funcName = path.node.id?.name;
-          if (funcName && initializationCalls.has(funcName) && !functionNames.has(funcName)) {
-            allFunctions.push({
-              name: funcName,
-              node: path.node,
-              type: 'expression'
-            });
-            functionNames.add(funcName);
-            if (config.verbose) {
-              console.log(`  [补充提取] 初始化依赖函数表达式: ${funcName}`);
-            }
-          }
+    // 收集立即执行函数中的依赖
+    const immediateFunctionsData = extractImmediateFunctions(code);
+    const immediateDependencies = immediateFunctionsData.dependencies;
+    
+// 合并所有依赖
+const allDependencies = new Set([...initializationCalls, ...immediateDependencies]);
+
+if (config.verbose && allDependencies.size > 0) {
+  console.log(`  [依赖汇总] 发现的总依赖函数: ${Array.from(allDependencies).join(', ')}`);
+}
+
+// 确保所有依赖函数都被提取（即使它们自身可能不符合拦截模式）
+traverse(ast, {
+  FunctionDeclaration(path) {
+    const funcName = path.node.id?.name;
+    if (funcName && allDependencies.has(funcName) && !functionNames.has(funcName)) {
+      allFunctions.push({
+        name: funcName,
+        node: path.node,
+        type: 'declaration'
+      });
+      functionNames.add(funcName);
+      if (config.verbose) {
+        console.log(`  [补充提取] 依赖函数声明: ${funcName}`);
+      }
+    }
+  },
+  
+  VariableDeclarator(path) {
+    if (path.node.init && path.node.init.type === 'FunctionExpression') {
+      const funcName = path.node.id?.name;
+      if (funcName && allDependencies.has(funcName) && !functionNames.has(funcName)) {
+        allFunctions.push({
+          name: funcName,
+          node: path.node,
+          type: 'expression'
+        });
+        functionNames.add(funcName);
+        if (config.verbose) {
+          console.log(`  [补充提取] 依赖函数表达式: ${funcName}`);
         }
       }
-    });
+    }
+  }
+});
 
-    // 提取函数代码（按依赖顺序）
+// 额外提取：即使函数不符合拦截模式，但如果被其他函数调用，也应该被提取
+// 这是为了处理像 f() 这样参数数量不符合要求但被依赖的函数
+traverse(ast, {
+  CallExpression(path) {
+    const funcName = extractFunctionName(path.node.callee);
+    if (funcName && !functionNames.has(funcName) && !allDependencies.has(funcName)) {
+      // 如果这个函数被其他函数调用，但没有被提取，检查它是否定义在代码中
+      if (config.interceptPattern.test(funcName)) {
+        // 即使参数数量不符合要求，但因为是关键依赖，也应该提取
+        if (config.verbose) {
+          console.log(`  [关键依赖] 函数 ${funcName} 被调用但未提取，检查是否定义`);
+        }
+      }
+    }
+  }
+});
+
+    // 简单策略：先提取所有函数定义，按发现的顺序
     const extractedFunctions = [];
     
-    // 简单策略：先提取所有函数定义
     allFunctions.forEach(funcInfo => {
       let functionCode;
       if (funcInfo.type === 'declaration') {
@@ -316,6 +456,10 @@ function extractFunctionDefinitions(code) {
         console.log(`  [提取] ${funcInfo.type === 'declaration' ? '函数' : '函数表达式'}: ${funcInfo.name}`);
       }
     });
+    
+    if (config.verbose && extractedFunctions.length > 0) {
+      console.log(`  [提取完成] 共提取 ${extractedFunctions.length} 个函数: ${extractedFunctions.join(', ')}`);
+    }
 
     return {
       functions: extractedFunctions,
@@ -386,12 +530,13 @@ function isInitializationFunction(path) {
 }
 
 /**
- * 提取立即执行函数代码
+ * 提取立即执行函数代码及其依赖
  * @param {string} code - 源代码
- * @returns {Array} - 立即执行函数代码列表
+ * @returns {Object} - 包含立即执行函数代码和发现的依赖函数集合
  */
 function extractImmediateFunctions(code) {
   const immediateFunctions = [];
+  const foundDependencies = new Set();
   
   try {
     const ast = parser.parse(code, {
@@ -406,6 +551,19 @@ function extractImmediateFunctions(code) {
         if (path.node.expression.type === 'CallExpression' && 
             path.node.expression.callee.type === 'FunctionExpression') {
           
+          // 分析立即执行函数内部调用的函数
+          traverse(path.node.expression.callee, {
+            CallExpression(innerPath) {
+              const funcName = extractFunctionName(innerPath.node.callee);
+              if (funcName && config.interceptPattern.test(funcName)) {
+                foundDependencies.add(funcName);
+                if (config.verbose) {
+                  console.log(`  [立即函数依赖] 发现依赖函数: ${funcName}`);
+                }
+              }
+            }
+          }, path.scope);
+          
           // 直接使用完整的表达式语句
           const immediateFunctionCode = generate(path.node).code;
           immediateFunctions.push(immediateFunctionCode);
@@ -419,6 +577,19 @@ function extractImmediateFunctions(code) {
       CallExpression(path) {
         // 检查是否是立即执行函数（可能在复杂表达式中）
         if (path.node.callee.type === 'FunctionExpression') {
+          // 分析立即执行函数内部调用的函数
+          traverse(path.node.callee, {
+            CallExpression(innerPath) {
+              const funcName = extractFunctionName(innerPath.node.callee);
+              if (funcName && config.interceptPattern.test(funcName)) {
+                foundDependencies.add(funcName);
+                if (config.verbose) {
+                  console.log(`  [立即函数依赖] 发现依赖函数: ${funcName}`);
+                }
+              }
+            }
+          }, path.scope);
+          
           // 确保语法正确：添加必要的括号
           const functionExprCode = generate(path.node.callee).code;
           const argsCode = generate(path.node).code.substring(functionExprCode.length);
@@ -439,7 +610,10 @@ function extractImmediateFunctions(code) {
     }
   }
   
-  return immediateFunctions;
+  return {
+    functions: immediateFunctions,
+    dependencies: foundDependencies
+  };
 }
 
 /**
@@ -715,8 +889,10 @@ console.log = () => {}; // 静默console.log
 
 // 安全的函数包装器
 function safeCall(func, args, callStr) {
+  const startTime = Date.now();
   try {
     const result = func(...args);
+    const elapsedTime = Date.now() - startTime;
     
     // 记录调用结果
     if (typeof globalResults !== 'undefined') {
@@ -729,37 +905,56 @@ function safeCall(func, args, callStr) {
         call: callStr,
         args: args,
         result: result,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        elapsedTime: elapsedTime
       });
     }
     
+    // 立即输出日志，避免死循环时看不到进度
+    console.log('[执行成功] ' + callStr + ' -> ' + JSON.stringify(result) + ' (' + elapsedTime + 'ms)');
+    
     return true;
   } catch (e) {
+    const elapsedTime = Date.now() - startTime;
+    
     // 记录错误信息（调试模式）
     if (typeof globalCallLog !== 'undefined') {
       globalCallLog.push({
         call: callStr,
         args: args,
         error: e.message,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        elapsedTime: elapsedTime
       });
     }
+    
+    // 立即输出错误日志，避免死循环时看不到进度
+    console.log('[执行失败] ' + callStr + ' -> ' + e.message + ' (' + elapsedTime + 'ms)');
+    if (e.stack) {
+      console.log('[错误堆栈] ' + e.stack.substring(0, 500));
+    }
+    
     return false;
   }
 }
 `;
 
   // 添加立即执行函数到测试环境中（在函数定义之前执行）
-  const immediateFunctions = extractImmediateFunctions(originalCode);
-  if (immediateFunctions.length > 0) {
+  const immediateFunctionsData = extractImmediateFunctions(originalCode);
+  if (immediateFunctionsData.functions.length > 0) {
     testCode += '\n// 执行立即函数（初始化环境）\n';
-    immediateFunctions.forEach((immediateFunc, index) => {
+    immediateFunctionsData.functions.forEach((immediateFunc, index) => {
       testCode += `
 // 立即执行函数 ${index + 1}
 ${immediateFunc}
 `;
     });
     testCode += '\n';
+    
+    // 记录立即执行函数中发现的依赖
+    if (immediateFunctionsData.dependencies.size > 0 && config.verbose) {
+      console.log(`  [立即函数依赖] 发现的依赖函数: ${Array.from(immediateFunctionsData.dependencies).join(', ')}`);
+    }
   }
 
   // 添加所有函数定义（可能包含跟踪代码）
@@ -805,10 +1000,21 @@ function testActualCalls() {
 }
 
 // 执行测试
+console.log("=== 开始执行测试代码 ===");
+console.log('总共需要测试 ${actualCalls.length} 个函数调用');
+
+const testStartTime = Date.now();
 try {
   testActualCalls();
+  const testElapsedTime = Date.now() - testStartTime;
+  console.log('=== 测试执行完成 (' + testElapsedTime + 'ms) ===');
 } catch (e) {
+  const testElapsedTime = Date.now() - testStartTime;
+  console.log('=== 测试执行出错 (' + testElapsedTime + 'ms) ===');
   console.log("测试执行出错:", e.message);
+  if (e.stack) {
+    console.log("测试错误堆栈:", e.stack);
+  }
 }
 `;
 
@@ -1423,16 +1629,46 @@ function processWithNewStrategy(sourceCode, outputPath) {
   });
   
   let callExpressionMap;
+  const vmStartTime = Date.now();
   try {
+    // 设置执行超时保护
+    const maxExecutionTime = 30000; // 30秒超时
+    const timeoutId = setTimeout(() => {
+      throw new Error(`VM执行超时 (${maxExecutionTime}ms)`);
+    }, maxExecutionTime);
+    
     // 执行测试代码
     vm.runInContext(testCode, context);
+    
+    // 清除超时计时器
+    clearTimeout(timeoutId);
+    
     // 获取结果
     callExpressionMap = globalResults;
+    
+    const vmElapsedTime = Date.now() - vmStartTime;
+    console.log('  [VM执行] 完成 (' + vmElapsedTime + 'ms)');
+    
   } catch (error) {
-    console.log(`  [错误] 测试代码执行失败: ${error.message}`);
+    const vmElapsedTime = Date.now() - vmStartTime;
+    console.log('  [错误] 测试代码执行失败 (' + vmElapsedTime + 'ms): ' + error.message);
+    
     if (config.verbose) {
       console.log(`  [调试] 错误堆栈:`, error.stack);
+      
+      // 保存测试代码用于调试
+      if (config.outputDebug) {
+        const debugInfo = {
+          timestamp: new Date().toISOString(),
+          error: error.message,
+          stack: error.stack,
+          elapsedTime: vmElapsedTime,
+          testCode: testCode.substring(0, 10000) // 保存前10000字符
+        };
+        fs.writeFileSync(config.outputDebug + '.vm-error.json', JSON.stringify(debugInfo, null, 2), 'utf-8');
+      }
     }
+    
     return null;
   }
   
