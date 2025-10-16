@@ -692,7 +692,17 @@ function extractFunctionName(callee) {
   } else if (callee.type === 'MemberExpression') {
     // 成员表达式调用: obj.f123(...) 或 this.f123(...)
     if (callee.property.type === 'Identifier') {
-      return callee.property.name;
+      const propertyName = callee.property.name;
+      
+      // 检查是否是 JavaScript 保留关键字
+      const reservedKeywords = ['default', 'function', 'var', 'let', 'const', 'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue', 'return', 'this', 'typeof', 'instanceof', 'new', 'delete', 'void', 'in', 'try', 'catch', 'finally', 'throw', 'class', 'extends', 'super', 'import', 'export', 'null', 'true', 'false', 'undefined', 'NaN', 'Infinity'];
+      
+      if (reservedKeywords.includes(propertyName)) {
+        // 对于保留关键字，返回 null 表示不处理这种调用
+        return null;
+      }
+      
+      return propertyName;
     }
   }
   return null;
