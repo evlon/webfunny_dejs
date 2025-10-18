@@ -704,11 +704,11 @@ function extractFunctionDefinitions(code) {
 
 /**
  * 检查参数是否都是常量
- * @param {Array} arguments - AST参数节点数组
+ * @param {Array} args - AST参数节点数组
  * @returns {Array} - 常量参数值数组（包含undefined表示非常量）
  */
-function extractConstantArguments(arguments) {
-  return arguments.map(arg => {
+function extractConstantArguments(args) {
+  return args.map(arg => {
     if (arg.type === 'StringLiteral') return arg.value;
     if (arg.type === 'NumericLiteral') return arg.value;
     if (arg.type === 'BooleanLiteral') return arg.value;
