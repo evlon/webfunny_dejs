@@ -185,7 +185,52 @@ function preprocessCode(code) {
 }
 
 /**
- * 收集初始化函数中调用的所有函数（包括嵌套依赖）
+ * 收集函数参数中的依赖关系（如 f2(f1) 这种模式）
+ * @param {string} code - 源代码
+ * @returns {Set} - 参数中发现的函数依赖集合
+ */
+function collectParameterDependencies(code) {
+  const parameterDependencies = new Set();
+  
+  try {
+    const ast = parser.parse(code, {
+      sourceType: 'module',
+      allowImportExportEverywhere: true,
+      allowReturnOutsideFunction: true
+    });
+
+    traverse(ast, {
+      CallExpression(path) {
+        const funcName = extractFunctionName(path.node.callee);
+        
+        if (funcName && config.interceptPattern.test(funcName)) {
+          // 检查函数参数中是否包含其他函数引用
+          path.node.arguments.forEach((arg, index) => {
+            if (arg.type === 'Identifier') {
+              const argFuncName = arg.name;
+              if (config.interceptPattern.test(argFuncName)) {
+                // 发现参数依赖：funcName 的参数引用了 argFuncName
+                parameterDependencies.add(argFuncName);
+                if (config.verbose) {
+                  console.log(`  [参数依赖] ${funcName} 的参数 ${index} 引用了函数 ${argFuncName}`);
+                }
+              }
+            }
+          });
+        }
+      }
+    });
+  } catch (error) {
+    if (config.verbose) {
+      console.log(`  [警告] 收集参数依赖失败: ${error.message}`);
+    }
+  }
+  
+  return parameterDependencies;
+}
+
+/**
+ * 收集初始化函数中调用的所有函数（包括嵌套依赖和参数依赖）
  * @param {string} code - 源代码
  * @returns {Set} - 初始化函数中调用的函数名集合
  */
@@ -215,7 +260,11 @@ function collectInitializationFunctionCalls(code) {
       }
     });
 
-    // 递归分析依赖关系
+    // 收集参数依赖
+    const parameterDeps = collectParameterDependencies(code);
+    parameterDeps.forEach(dep => initializationCalls.add(dep));
+
+    // 递归分析依赖关系（包括参数依赖和调用依赖）
     let hasNewDependencies = true;
     while (hasNewDependencies) {
       hasNewDependencies = false;
@@ -240,6 +289,20 @@ function collectInitializationFunctionCalls(code) {
                 }
               }
             }, path.scope);
+            
+            // 分析这个函数参数中的依赖
+            path.node.params.forEach((param, index) => {
+              if (param.type === 'Identifier') {
+                const paramName = param.name;
+                if (config.interceptPattern.test(paramName) && !initializationCalls.has(paramName)) {
+                  initializationCalls.add(paramName);
+                  hasNewDependencies = true;
+                  if (config.verbose) {
+                    console.log(`  [参数依赖] ${funcName} 的参数 ${index} 引用了函数 ${paramName}`);
+                  }
+                }
+              }
+            });
           }
         },
         
@@ -262,6 +325,22 @@ function collectInitializationFunctionCalls(code) {
                   }
                 }
               }, path.scope);
+              
+              // 分析函数表达式参数中的依赖
+              if (path.node.init.params) {
+                path.node.init.params.forEach((param, index) => {
+                  if (param.type === 'Identifier') {
+                    const paramName = param.name;
+                    if (config.interceptPattern.test(paramName) && !initializationCalls.has(paramName)) {
+                      initializationCalls.add(paramName);
+                      hasNewDependencies = true;
+                      if (config.verbose) {
+                        console.log(`  [参数依赖] ${funcName} 的参数 ${index} 引用了函数 ${paramName}`);
+                      }
+                    }
+                  }
+                });
+              }
             }
           }
         }
@@ -278,6 +357,116 @@ function collectInitializationFunctionCalls(code) {
   }
   
   return initializationCalls;
+}
+
+/**
+ * 构建完整的函数依赖图（包括参数依赖、调用依赖等）
+ * @param {string} code - 源代码
+ * @returns {Map} - 依赖图，key为函数名，value为依赖的函数名集合
+ */
+function buildFunctionDependencyGraph(code) {
+  const dependencyGraph = new Map();
+  
+  try {
+    const ast = parser.parse(code, {
+      sourceType: 'module',
+      allowImportExportEverywhere: true,
+      allowReturnOutsideFunction: true
+    });
+
+    // 先收集所有匹配的函数
+    const allFunctions = new Set();
+    traverse(ast, {
+      FunctionDeclaration(path) {
+        const funcName = path.node.id?.name;
+        if (funcName && config.interceptPattern.test(funcName)) {
+          allFunctions.add(funcName);
+          dependencyGraph.set(funcName, new Set());
+        }
+      },
+      
+      VariableDeclarator(path) {
+        if (path.node.init && path.node.init.type === 'FunctionExpression') {
+          const funcName = path.node.id?.name;
+          if (funcName && config.interceptPattern.test(funcName)) {
+            allFunctions.add(funcName);
+            dependencyGraph.set(funcName, new Set());
+          }
+        }
+      }
+    });
+
+    // 分析每个函数的依赖关系
+    traverse(ast, {
+      FunctionDeclaration(path) {
+        const funcName = path.node.id?.name;
+        if (funcName && dependencyGraph.has(funcName)) {
+          const dependencies = dependencyGraph.get(funcName);
+          
+          // 分析函数体中的调用依赖
+          traverse(path.node, {
+            CallExpression(innerPath) {
+              const calledFuncName = extractFunctionName(innerPath.node.callee);
+              if (calledFuncName && allFunctions.has(calledFuncName) && calledFuncName !== funcName) {
+                dependencies.add(calledFuncName);
+              }
+            }
+          }, path.scope);
+          
+          // 分析函数参数中的依赖
+          path.node.params.forEach(param => {
+            if (param.type === 'Identifier' && allFunctions.has(param.name) && param.name !== funcName) {
+              dependencies.add(param.name);
+            }
+          });
+        }
+      },
+      
+      VariableDeclarator(path) {
+        if (path.node.init && path.node.init.type === 'FunctionExpression') {
+          const funcName = path.node.id?.name;
+          if (funcName && dependencyGraph.has(funcName)) {
+            const dependencies = dependencyGraph.get(funcName);
+            
+            // 分析函数表达式体中的调用依赖
+            traverse(path.node.init, {
+              CallExpression(innerPath) {
+                const calledFuncName = extractFunctionName(innerPath.node.callee);
+                if (calledFuncName && allFunctions.has(calledFuncName) && calledFuncName !== funcName) {
+                  dependencies.add(calledFuncName);
+                }
+              }
+            }, path.scope);
+            
+            // 分析函数表达式参数中的依赖
+            if (path.node.init.params) {
+              path.node.init.params.forEach(param => {
+                if (param.type === 'Identifier' && allFunctions.has(param.name) && param.name !== funcName) {
+                  dependencies.add(param.name);
+                }
+              });
+            }
+          }
+        }
+      }
+    });
+
+    if (config.verbose) {
+      console.log(`  [依赖图构建完成] 共分析 ${dependencyGraph.size} 个函数的依赖关系`);
+      dependencyGraph.forEach((deps, func) => {
+        if (deps.size > 0) {
+          console.log(`    ${func} -> ${Array.from(deps).join(', ')}`);
+        }
+      });
+    }
+    
+  } catch (error) {
+    if (config.verbose) {
+      console.log(`  [警告] 构建依赖图失败: ${error.message}`);
+    }
+  }
+  
+  return dependencyGraph;
 }
 
 /**
@@ -379,81 +568,123 @@ function extractFunctionDefinitions(code) {
     const immediateFunctionsData = extractImmediateFunctions(code);
     const immediateDependencies = immediateFunctionsData.dependencies;
     
-// 合并所有依赖
-const allDependencies = new Set([...initializationCalls, ...immediateDependencies]);
+    // 收集参数依赖（f2(f1) 这种模式）
+    const parameterDependencies = collectParameterDependencies(code);
+    
+    // 合并所有依赖
+    const allDependencies = new Set([...initializationCalls, ...immediateDependencies, ...parameterDependencies]);
 
-if (config.verbose && allDependencies.size > 0) {
-  console.log(`  [依赖汇总] 发现的总依赖函数: ${Array.from(allDependencies).join(', ')}`);
-}
+    if (config.verbose && allDependencies.size > 0) {
+      console.log(`  [依赖汇总] 发现的总依赖函数: ${Array.from(allDependencies).join(', ')}`);
+    }
 
-// 确保所有依赖函数都被提取（即使它们自身可能不符合拦截模式）
-traverse(ast, {
-  FunctionDeclaration(path) {
-    const funcName = path.node.id?.name;
-    if (funcName && allDependencies.has(funcName) && !functionNames.has(funcName)) {
-      allFunctions.push({
-        name: funcName,
-        node: path.node,
-        type: 'declaration'
-      });
-      functionNames.add(funcName);
+    // 确保所有依赖函数都被提取（即使它们自身可能不符合拦截模式）
+    traverse(ast, {
+      FunctionDeclaration(path) {
+        const funcName = path.node.id?.name;
+        if (funcName && allDependencies.has(funcName) && !functionNames.has(funcName)) {
+          allFunctions.push({
+            name: funcName,
+            node: path.node,
+            type: 'declaration'
+          });
+          functionNames.add(funcName);
+          if (config.verbose) {
+            console.log(`  [补充提取] 依赖函数声明: ${funcName}`);
+          }
+        }
+      },
+      
+      VariableDeclarator(path) {
+        if (path.node.init && path.node.init.type === 'FunctionExpression') {
+          const funcName = path.node.id?.name;
+          if (funcName && allDependencies.has(funcName) && !functionNames.has(funcName)) {
+            allFunctions.push({
+              name: funcName,
+              node: path.node,
+              type: 'expression'
+            });
+            functionNames.add(funcName);
+          if (config.verbose) {
+            console.log(`  [补充提取] 依赖函数表达式: ${funcName}`);
+          }
+        }
+      }
+    }
+  });
+
+    // 额外提取：即使函数不符合拦截模式，但如果被其他函数调用，也应该被提取
+    // 这是为了处理像 f() 这样参数数量不符合要求但被依赖的函数
+    traverse(ast, {
+      CallExpression(path) {
+        const funcName = extractFunctionName(path.node.callee);
+        if (funcName && !functionNames.has(funcName) && !allDependencies.has(funcName)) {
+          // 如果这个函数被其他函数调用，但没有被提取，检查它是否定义在代码中
+          if (config.interceptPattern.test(funcName)) {
+            // 即使参数数量不符合要求，但因为是关键依赖，也应该提取
+            if (config.verbose) {
+              console.log(`  [关键依赖] 函数 ${funcName} 被调用但未提取，检查是否定义`);
+            }
+          }
+        }
+      }
+    });
+
+    // 构建完整的依赖图并拓扑排序
+    const dependencyGraph = buildFunctionDependencyGraph(code);
+    let sortedFunctions;
+    
+    try {
+      sortedFunctions = topologicalSort(dependencyGraph);
+      if (config.verbose && sortedFunctions.length > 0) {
+        console.log(`  [拓扑排序] 依赖顺序: ${sortedFunctions.join(' -> ')}`);
+      }
+    } catch (error) {
       if (config.verbose) {
-        console.log(`  [补充提取] 依赖函数声明: ${funcName}`);
+        console.log(`  [警告] 拓扑排序失败: ${error.message}，使用发现顺序`);
       }
+      // 排序失败时使用原来的函数顺序
+      sortedFunctions = allFunctions.map(f => f.name);
     }
-  },
-  
-  VariableDeclarator(path) {
-    if (path.node.init && path.node.init.type === 'FunctionExpression') {
-      const funcName = path.node.id?.name;
-      if (funcName && allDependencies.has(funcName) && !functionNames.has(funcName)) {
-        allFunctions.push({
-          name: funcName,
-          node: path.node,
-          type: 'expression'
-        });
-        functionNames.add(funcName);
-        if (config.verbose) {
-          console.log(`  [补充提取] 依赖函数表达式: ${funcName}`);
-        }
-      }
-    }
-  }
-});
-
-// 额外提取：即使函数不符合拦截模式，但如果被其他函数调用，也应该被提取
-// 这是为了处理像 f() 这样参数数量不符合要求但被依赖的函数
-traverse(ast, {
-  CallExpression(path) {
-    const funcName = extractFunctionName(path.node.callee);
-    if (funcName && !functionNames.has(funcName) && !allDependencies.has(funcName)) {
-      // 如果这个函数被其他函数调用，但没有被提取，检查它是否定义在代码中
-      if (config.interceptPattern.test(funcName)) {
-        // 即使参数数量不符合要求，但因为是关键依赖，也应该提取
-        if (config.verbose) {
-          console.log(`  [关键依赖] 函数 ${funcName} 被调用但未提取，检查是否定义`);
-        }
-      }
-    }
-  }
-});
-
-    // 简单策略：先提取所有函数定义，按发现的顺序
+    
+    // 按依赖顺序提取函数
     const extractedFunctions = [];
     
-    allFunctions.forEach(funcInfo => {
-      let functionCode;
-      if (funcInfo.type === 'declaration') {
-        functionCode = generate(funcInfo.node).code;
-      } else {
-        functionCode = generate(funcInfo.node).code;
+    sortedFunctions.forEach(funcName => {
+      const funcInfo = allFunctions.find(f => f.name === funcName);
+      if (funcInfo) {
+        let functionCode;
+        if (funcInfo.type === 'declaration') {
+          functionCode = generate(funcInfo.node).code;
+        } else {
+          functionCode = generate(funcInfo.node).code;
+        }
+        
+        extractedFunctions.push(funcInfo.name);
+        functionCodeMap.set(funcInfo.name, functionCode);
+        
+        if (config.verbose) {
+          console.log(`  [提取] ${funcInfo.type === 'declaration' ? '函数' : '函数表达式'}: ${funcInfo.name}`);
+        }
       }
-      
-      extractedFunctions.push(funcInfo.name);
-      functionCodeMap.set(funcInfo.name, functionCode);
-      
-      if (config.verbose) {
-        console.log(`  [提取] ${funcInfo.type === 'declaration' ? '函数' : '函数表达式'}: ${funcInfo.name}`);
+    });
+    
+    // 处理不在依赖图中的函数（通常是孤立函数）
+    allFunctions.forEach(funcInfo => {
+      if (!sortedFunctions.includes(funcInfo.name)) {
+        let functionCode;
+        if (funcInfo.type === 'declaration') {
+          functionCode = generate(funcInfo.node).code;
+        } else {
+          functionCode = generate(funcInfo.node).code;
+        }
+        
+        extractedFunctions.push(funcInfo.name);
+        functionCodeMap.set(funcInfo.name, functionCode);
+        
+        if (config.verbose) {
+          console.log(`  [补充提取] 孤立函数: ${funcInfo.name}`);
+        }
       }
     });
     
@@ -739,18 +970,29 @@ function extractActualFunctionCalls(code) {
           // 检查参数是否都是常量
           const args = extractConstantArguments(path.node.arguments);
           
-          // 只有当所有参数都是常量时才记录
-          const allConstants = args.every(arg => arg !== undefined);
-          
-          if (allConstants) {
-            const callExpression = path.toString();
-            actualCalls.push({
-              callExpression: callExpression,
-              funcName: funcName,
-              args: args,
-              path: path
-            });
-          }
+            // 只有当所有参数都是常量时才记录
+            const allConstants = args.every(arg => arg !== undefined);
+            
+            if (allConstants) {
+              let callExpression;
+              try {
+                // 使用 generate 函数安全地生成调用表达式代码
+                callExpression = generate(path.node).code;
+              } catch (error) {
+                // 如果生成失败，尝试使用 toString
+                callExpression = path.toString();
+              }
+              
+              // 确保调用表达式是有效的字符串
+              if (typeof callExpression === 'string' && callExpression !== '[object Object]') {
+                actualCalls.push({
+                  callExpression: callExpression,
+                  funcName: funcName,
+                  args: args,
+                  path: path
+                });
+              }
+            }
         }
       },
       
@@ -1066,36 +1308,46 @@ function applyCallExpressionReplacements(code, callExpressionMap) {
           
           // 检查是否匹配拦截模式
           if (shouldInterceptFunction(funcName, path.node.arguments.length)) {
-            const callExpression = path.toString();
+            let callExpression;
+            try {
+              // 使用 generate 函数安全地生成调用表达式代码
+              callExpression = generate(path.node).code;
+            } catch (error) {
+              // 如果生成失败，尝试使用 toString
+              callExpression = path.toString();
+            }
             
-            if (callExpressionMap.has(callExpression)) {
-              const result = callExpressionMap.get(callExpression);
-              
-              // 根据结果类型创建对应的字面量节点
-              let replacementNode;
-              if (typeof result === 'string') {
-                replacementNode = t.stringLiteral(result);
-              } else if (typeof result === 'number') {
-                replacementNode = t.numericLiteral(result);
-              } else if (typeof result === 'boolean') {
-                replacementNode = t.booleanLiteral(result);
-              } else if (result === null) {
-                replacementNode = t.nullLiteral();
-              } else if (result === undefined) {
-                replacementNode = t.identifier('undefined');
-              } else {
-                // 对于复杂类型，使用字符串表示或跳过
-                if (config.verbose) {
-                  console.log(`  [跳过] ${callExpression} -> 复杂类型: ${typeof result}`);
+            // 确保调用表达式是有效的字符串
+            if (typeof callExpression === 'string' && callExpression !== '[object Object]') {
+              if (callExpressionMap.has(callExpression)) {
+                const result = callExpressionMap.get(callExpression);
+                
+                // 根据结果类型创建对应的字面量节点
+                let replacementNode;
+                if (typeof result === 'string') {
+                  replacementNode = t.stringLiteral(result);
+                } else if (typeof result === 'number') {
+                  replacementNode = t.numericLiteral(result);
+                } else if (typeof result === 'boolean') {
+                  replacementNode = t.booleanLiteral(result);
+                } else if (result === null) {
+                  replacementNode = t.nullLiteral();
+                } else if (result === undefined) {
+                  replacementNode = t.identifier('undefined');
+                } else {
+                  // 对于复杂类型，使用字符串表示或跳过
+                  if (config.verbose) {
+                    console.log(`  [跳过] ${callExpression} -> 复杂类型: ${typeof result}`);
+                  }
+                  return;
                 }
-                return;
-              }
-              
-              path.replaceWith(replacementNode);
-              replaceCount++;
-              
-              if (config.verbose) {
-                console.log(`  [替换] ${callExpression} -> ${JSON.stringify(result)}`);
+                
+                path.replaceWith(replacementNode);
+                replaceCount++;
+                
+                if (config.verbose) {
+                  console.log(`  [替换] ${callExpression} -> ${JSON.stringify(result)}`);
+                }
               }
             }
           }
@@ -1196,8 +1448,8 @@ function analyzeFunctionsForCleanup(code, callExpressionMap, actualCalls) {
       // 检查引用次数
       const referenceCount = functionReferences.get(funcName) || 0;
       
-      // 如果函数只被常量函数调用且引用次数少，可以考虑清理
-      if (isOnlyCalledByConstants && referenceCount <= actualCalls.filter(call => call.funcName === funcName).length) {
+      // 如果函数只被常量函数调用 或者 引用次数少，可以考虑清理
+      if (isOnlyCalledByConstants || referenceCount <= actualCalls.filter(call => call.funcName === funcName).length) {
         functionsToCleanup.add(funcName);
         if (config.verbose) {
           console.log(`  [清理分析] 可以清理的函数: ${funcName} (引用次数: ${referenceCount})`);
@@ -1207,6 +1459,7 @@ function analyzeFunctionsForCleanup(code, callExpressionMap, actualCalls) {
 
     // 分析立即执行函数是否可以清理
     // 简化逻辑：如果立即执行函数中调用的函数都已经被替换，就可以清理
+    let shouldCleanupImmediateFunctions = false;
     const immediateFunctionCallsToCheck = new Map();
     
     // 收集所有立即执行函数
@@ -1241,6 +1494,7 @@ function analyzeFunctionsForCleanup(code, callExpressionMap, actualCalls) {
           // 如果没有未替换的调用，就可以清理这个立即执行函数
           if (!hasUnreplacedCalls) {
             immediateFunctionsToCleanup.add(immediateFunctionKey);
+            shouldCleanupImmediateFunctions = true;
             if (config.verbose) {
               console.log(`  [清理分析] 可以清理的立即执行函数: ${immediateFunctionCode.substring(0, 100)}...`);
             }
