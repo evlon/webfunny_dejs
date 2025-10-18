@@ -795,9 +795,13 @@ function extractImmediateFunctions(code) {
             }
           }, path.scope);
           
-          // 直接使用完整的表达式语句
-          const immediateFunctionCode = generate(path.node).code;
-          immediateFunctions.push(immediateFunctionCode);
+          // 确保立即执行函数被正确包装
+          const functionExprCode = generate(path.node.expression.callee).code;
+          const argsCode = generate(path.node.expression).code.substring(functionExprCode.length);
+          
+          // 正确包装： (function(){})()
+          const immediateFunctionCode = `(${functionExprCode})${argsCode}`;
+          immediateFunctions.push(immediateFunctionCode + ';');
           
           if (config.verbose) {
             console.log(`  [提取] 立即执行函数: ${immediateFunctionCode.substring(0, 100)}...`);
@@ -1195,12 +1199,22 @@ function safeCall(func, args, callStr) {
   const immediateFunctionsData = extractImmediateFunctions(originalCode);
   if (immediateFunctionsData.functions.length > 0) {
     testCode += '\n// 执行立即函数（初始化环境）\n';
+    
+    // 创建一个集合来跟踪已经添加的立即执行函数
+    const addedImmediateFunctions = new Set();
+    
     immediateFunctionsData.functions.forEach((immediateFunc, index) => {
-      testCode += `
+      // 检查是否已经添加过这个立即执行函数
+      const funcKey = Buffer.from(immediateFunc).toString('base64').substring(0, 10);
+      if (!addedImmediateFunctions.has(funcKey)) {
+        testCode += `
 // 立即执行函数 ${index + 1}
 ${immediateFunc}
 `;
+        addedImmediateFunctions.add(funcKey);
+      }
     });
+    
     testCode += '\n';
     
     // 记录立即执行函数中发现的依赖
@@ -1458,11 +1472,40 @@ function analyzeFunctionsForCleanup(code, callExpressionMap, actualCalls) {
     }
 
     // 分析立即执行函数是否可以清理
-    // 简化逻辑：如果立即执行函数中调用的函数都已经被替换，就可以清理
-    let shouldCleanupImmediateFunctions = false;
-    const immediateFunctionCallsToCheck = new Map();
+    // 新策略：清理出现在第一个require(...)之前的立即执行函数
+    let hasSeenRequire = false;
+    let firstRequireLine = -1;
     
-    // 收集所有立即执行函数
+    // 首先找到第一个require语句的位置
+    traverse(ast, {
+      CallExpression(path) {
+        if (path.node.callee.type === 'Identifier' && path.node.callee.name === 'require') {
+          if (!hasSeenRequire) {
+            hasSeenRequire = true;
+            // 记录第一个require语句的位置
+            if (path.node.loc) {
+              firstRequireLine = path.node.loc.start.line;
+              if (config.verbose) {
+                console.log(`  [清理分析] 找到第一个require语句在第 ${firstRequireLine} 行`);
+              }
+            }
+          }
+        }
+      }
+    });
+    
+    if (!hasSeenRequire) {
+      // 如果没有找到require语句，不清理任何立即执行函数
+      if (config.verbose) {
+        console.log(`  [清理分析] 未找到require语句，不清理任何立即执行函数`);
+      }
+      return {
+        functions: functionsToCleanup,
+        immediateFunctions: immediateFunctionsToCleanup
+      };
+    }
+    
+    // 收集所有在第一个require之前的立即执行函数
     traverse(ast, {
       ExpressionStatement(path) {
         if (path.node.expression.type === 'CallExpression' && 
@@ -1471,54 +1514,25 @@ function analyzeFunctionsForCleanup(code, callExpressionMap, actualCalls) {
           const immediateFunctionCode = generate(path.node).code;
           const immediateFunctionKey = `immediate_${Buffer.from(immediateFunctionCode).toString('base64').substring(0, 10)}`;
           
-          // 检查这个立即执行函数中是否还有未替换的函数调用
-          let hasUnreplacedCalls = false;
-          
-          // 遍历立即执行函数内部的调用
-          traverse(path.node.expression.callee, {
-            CallExpression(innerPath) {
-              const funcName = extractFunctionName(innerPath.node.callee);
-              if (funcName && config.interceptPattern.test(funcName)) {
-                // 检查这个调用是否已经被替换
-                const callExpression = innerPath.toString();
-                if (!callExpressionMap.has(callExpression)) {
-                  hasUnreplacedCalls = true;
-                  if (config.verbose) {
-                    console.log(`  [清理分析] 立即执行函数中还有未替换的调用: ${callExpression}`);
-                  }
-                }
+          // 检查立即执行函数的位置是否在第一个require之前
+          if (path.node.expression.loc) {
+            const immediateFunctionLine = path.node.expression.loc.start.line;
+            
+            if (immediateFunctionLine < firstRequireLine) {
+              // 在第一个require之前的立即执行函数可以清理
+              immediateFunctionsToCleanup.add(immediateFunctionKey);
+              if (config.verbose) {
+                console.log(`  [清理分析] 可以清理的立即执行函数（第 ${immediateFunctionLine} 行，在require之前）: ${immediateFunctionCode.substring(0, 100)}...`);
               }
-            }
-          });
-          
-          // 如果没有未替换的调用，就可以清理这个立即执行函数
-          if (!hasUnreplacedCalls) {
-            immediateFunctionsToCleanup.add(immediateFunctionKey);
-            shouldCleanupImmediateFunctions = true;
-            if (config.verbose) {
-              console.log(`  [清理分析] 可以清理的立即执行函数: ${immediateFunctionCode.substring(0, 100)}...`);
+            } else {
+              if (config.verbose) {
+                console.log(`  [清理分析] 跳过第 ${immediateFunctionLine} 行的立即执行函数（在require之后）`);
+              }
             }
           }
         }
       }
     });
-    
-    if (shouldCleanupImmediateFunctions) {
-      // 收集所有立即执行函数
-      traverse(ast, {
-        ExpressionStatement(path) {
-          if (path.node.expression.type === 'CallExpression' && 
-              path.node.expression.callee.type === 'FunctionExpression') {
-            const immediateFunctionCode = generate(path.node).code;
-            const immediateFunctionKey = `immediate_${Buffer.from(immediateFunctionCode).toString('base64').substring(0, 10)}`;
-            immediateFunctionsToCleanup.add(immediateFunctionKey);
-            if (config.verbose) {
-              console.log(`  [清理分析] 可以清理的立即执行函数: ${immediateFunctionCode.substring(0, 100)}...`);
-            }
-          }
-        }
-      });
-    }
 
   } catch (error) {
     if (config.verbose) {
