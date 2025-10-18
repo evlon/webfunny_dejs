@@ -1415,6 +1415,51 @@ function analyzeFunctionsForCleanup(code, callExpressionMap, actualCalls) {
         if (path.node.declaration && path.node.declaration.type === 'FunctionDeclaration') {
           exportedFunctions.add(path.node.declaration.id.name);
         }
+      },
+      AssignmentExpression(path) {
+        // 检测 CommonJS exports: module.exports.funcName = function
+        if (path.node.left.type === 'MemberExpression' &&
+            path.node.left.object.type === 'MemberExpression' &&
+            path.node.left.object.object?.name === 'module' &&
+            path.node.left.object.property?.name === 'exports' &&
+            path.node.left.property?.type === 'Identifier') {
+          
+          const exportedFuncName = path.node.left.property.name;
+          exportedFunctions.add(exportedFuncName);
+          if (config.verbose) {
+            console.log(`  [导出检测] CommonJS导出: ${exportedFuncName}`);
+          }
+        }
+        // 检测 exports.funcName = function
+        else if (path.node.left.type === 'MemberExpression' &&
+                 path.node.left.object?.name === 'exports' &&
+                 path.node.left.property?.type === 'Identifier') {
+          
+          const exportedFuncName = path.node.left.property.name;
+          exportedFunctions.add(exportedFuncName);
+          if (config.verbose) {
+            console.log(`  [导出检测] exports导出: ${exportedFuncName}`);
+          }
+        }
+      },
+      ObjectProperty(path) {
+        // 检测 module.exports = { funcName: func }
+        if (path.parentPath && 
+            path.parentPath.parentPath &&
+            path.parentPath.parentPath.node.type === 'AssignmentExpression' &&
+            path.parentPath.parentPath.node.left.type === 'MemberExpression' &&
+            path.parentPath.parentPath.node.left.object?.name === 'module' &&
+            path.parentPath.parentPath.node.left.property?.name === 'exports') {
+          
+          if (path.node.key.type === 'Identifier' && 
+              path.node.value.type === 'Identifier') {
+            const exportedFuncName = path.node.value.name;
+            exportedFunctions.add(exportedFuncName);
+            if (config.verbose) {
+              console.log(`  [导出检测] module.exports对象导出: ${exportedFuncName}`);
+            }
+          }
+        }
       }
     });
 
@@ -1561,73 +1606,62 @@ function cleanupDecryptedFunctions(code, cleanupData, cleanupMode) {
   }
 
   try {
+    // 第一阶段：分析依赖关系
     const ast = parser.parse(code, {
       sourceType: 'module',
       allowImportExportEverywhere: true,
       allowReturnOutsideFunction: true
     });
 
-    let functionCleanupCount = 0;
-    let immediateFunctionCleanupCount = 0;
-
-    // 清理普通函数
+    // 构建函数依赖图
+    const dependencyGraph = new Map();
+    const allFunctions = new Set();
+    
+    // 收集所有函数
     traverse(ast, {
       FunctionDeclaration(path) {
         const funcName = path.node.id?.name;
-        if (funcName && functionsToCleanup.has(funcName)) {
-          if (cleanupMode === 'comment') {
-            // 注释掉函数
-            const functionCode = generate(path.node).code;
-            const commentedCode = `/* [解密清理] 已解密的函数: ${funcName} */\n/*${functionCode.replace(/\/\*/g, '/\\*').replace(/\*\//g, '*\\/')}*/`;
-            
-            path.replaceWithMultiple(parser.parse(commentedCode).program.body);
-            functionCleanupCount++;
-            
-            if (config.verbose) {
-              console.log(`  [清理] 注释函数: ${funcName}`);
-            }
-          } else if (cleanupMode === 'remove') {
-            // 删除函数
-            path.remove();
-            functionCleanupCount++;
-            
-            if (config.verbose) {
-              console.log(`  [清理] 删除函数: ${funcName}`);
-            }
-          }
+        if (funcName) {
+          allFunctions.add(funcName);
+          dependencyGraph.set(funcName, new Set());
         }
       },
-      
       VariableDeclarator(path) {
         if (path.node.init && path.node.init.type === 'FunctionExpression') {
           const funcName = path.node.id?.name;
-          if (funcName && functionsToCleanup.has(funcName)) {
-            if (cleanupMode === 'comment') {
-              // 注释掉函数表达式
-              const functionCode = generate(path.node).code;
-              const commentedCode = `/* [解密清理] 已解密的函数表达式: ${funcName} */\n/*${functionCode.replace(/\/\*/g, '/\\*').replace(/\*\//g, '*\\/')}*/`;
-              
-              path.replaceWithMultiple(parser.parse(commentedCode).program.body);
-              functionCleanupCount++;
-              
-              if (config.verbose) {
-                console.log(`  [清理] 注释函数表达式: ${funcName}`);
-              }
-            } else if (cleanupMode === 'remove') {
-              // 删除函数表达式
-              path.remove();
-              functionCleanupCount++;
-              
-              if (config.verbose) {
-                console.log(`  [清理] 删除函数表达式: ${funcName}`);
-              }
-            }
+          if (funcName) {
+            allFunctions.add(funcName);
+            dependencyGraph.set(funcName, new Set());
           }
         }
       }
     });
 
-    // 清理立即执行函数
+    // 分析函数调用关系
+    traverse(ast, {
+      CallExpression(path) {
+        const caller = path.findParent(p => 
+          p.isFunctionDeclaration() || 
+          (p.isVariableDeclarator() && p.node.init?.type === 'FunctionExpression')
+        );
+        
+        const callerName = caller?.isFunctionDeclaration() 
+          ? caller.node.id?.name 
+          : caller?.isVariableDeclarator() ? caller.node.id?.name : null;
+        
+        const calleeName = extractFunctionName(path.node.callee);
+        
+        if (callerName && calleeName && allFunctions.has(calleeName)) {
+          dependencyGraph.get(callerName)?.add(calleeName);
+        }
+      }
+    });
+
+    // 第二阶段：安全清理
+    let functionCleanupCount = 0;
+    let immediateFunctionCleanupCount = 0;
+
+    // 1. 先清理立即执行函数（不会影响函数依赖）
     if (immediateFunctionsToCleanup.size > 0) {
       traverse(ast, {
         ExpressionStatement(path) {
@@ -1639,29 +1673,172 @@ function cleanupDecryptedFunctions(code, cleanupData, cleanupMode) {
             
             if (immediateFunctionsToCleanup.has(immediateFunctionKey)) {
               if (cleanupMode === 'comment') {
-                // 注释掉立即执行函数
                 const commentedCode = `/* [解密清理] 初始化函数（已完成解密） */\n/*${immediateFunctionCode.replace(/\/\*/g, '/\\*').replace(/\*\//g, '*\\/')}*/`;
-                
                 path.replaceWithMultiple(parser.parse(commentedCode).program.body);
-                immediateFunctionCleanupCount++;
-                
-                if (config.verbose) {
-                  console.log(`  [清理] 注释立即执行函数: ${immediateFunctionCode.substring(0, 100)}...`);
-                }
-              } else if (cleanupMode === 'remove') {
-                // 删除立即执行函数
+              } else {
                 path.remove();
-                immediateFunctionCleanupCount++;
-                
-                if (config.verbose) {
-                  console.log(`  [清理] 删除立即执行函数: ${immediateFunctionCode.substring(0, 100)}...`);
-                }
+              }
+              immediateFunctionCleanupCount++;
+              
+              if (config.verbose) {
+                console.log(`  [清理] ${cleanupMode === 'comment' ? '注释' : '删除'}立即执行函数: ${immediateFunctionCode.substring(0, 100)}...`);
               }
             }
           }
         }
       });
     }
+
+    // 2. 按依赖顺序清理函数（从叶子节点开始）
+    const safeToClean = new Set(functionsToCleanup);
+    
+    // 分析哪些函数被业务逻辑调用
+    const protectedFunctions = new Set();
+    let firstRequireLine = Infinity;
+    
+    // 首先找到第一个require的位置
+    traverse(ast, {
+      CallExpression(path) {
+        if (path.node.callee.type === 'Identifier' && path.node.callee.name === 'require') {
+          if (path.node.loc && path.node.loc.start.line < firstRequireLine) {
+            firstRequireLine = path.node.loc.start.line;
+          }
+        }
+      }
+    });
+    
+    // 1. 收集所有未被标记为清理的函数调用
+    traverse(ast, {
+      CallExpression(path) {
+        const funcName = extractFunctionName(path.node.callee);
+        if (funcName && allFunctions.has(funcName)) {
+          // 检查调用上下文是否在非清理区域
+          let isProtected = false;
+          let current = path;
+          
+          while (current = current.parentPath) {
+            // 如果在require之后的代码中
+            if (current.node.loc && firstRequireLine !== Infinity && 
+                current.node.loc.start.line > firstRequireLine) {
+              isProtected = true;
+              break;
+            }
+            
+            // 如果在导出的函数中
+            if (current.isExportNamedDeclaration() || current.isExportDefaultDeclaration()) {
+              isProtected = true;
+              break;
+            }
+            
+            // 如果在非清理函数中
+            if ((current.isFunctionDeclaration() || 
+                 (current.isVariableDeclarator() && current.node.init?.type === 'FunctionExpression')) 
+                && !functionsToCleanup.has(current.node.id?.name)) {
+              isProtected = true;
+              break;
+            }
+            
+            // 如果到达程序顶层
+            if (current.isProgram()) {
+              break;
+            }
+          }
+          
+          if (isProtected) {
+            protectedFunctions.add(funcName);
+            
+            // 保护整个调用链
+            const visited = new Set();
+            const stack = [funcName];
+            
+            while (stack.length > 0) {
+              const current = stack.pop();
+              if (!visited.has(current)) {
+                visited.add(current);
+                
+                // 向上保护调用者
+                for (const [caller, deps] of dependencyGraph) {
+                  if (deps.has(current)) {
+                    stack.push(caller);
+                  }
+                }
+                
+                // 向下保护依赖
+                for (const dep of dependencyGraph.get(current) || []) {
+                  stack.push(dep);
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+    
+    // 移除被保护函数及其依赖
+    for (const func of protectedFunctions) {
+      safeToClean.delete(func);
+      
+      // 保护这个函数的所有依赖
+      const visited = new Set();
+      const stack = [func];
+      
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (!visited.has(current)) {
+          visited.add(current);
+          safeToClean.delete(current);
+          
+          for (const dep of dependencyGraph.get(current) || []) {
+            stack.push(dep);
+          }
+        }
+      }
+      
+      if (config.verbose) {
+        console.log(`  [业务保护] 保留函数 ${func} 及其依赖链`);
+      }
+    }
+
+    // 实际执行函数清理
+    traverse(ast, {
+      FunctionDeclaration(path) {
+        const funcName = path.node.id?.name;
+        if (funcName && safeToClean.has(funcName)) {
+          if (cleanupMode === 'comment') {
+            const functionCode = generate(path.node).code;
+            const commentedCode = `/* [解密清理] 已解密的函数: ${funcName} */\n/*${functionCode.replace(/\/\*/g, '/\\*').replace(/\*\//g, '*\\/')}*/`;
+            path.replaceWithMultiple(parser.parse(commentedCode).program.body);
+          } else {
+            path.remove();
+          }
+          functionCleanupCount++;
+          
+          if (config.verbose) {
+            console.log(`  [清理] ${cleanupMode === 'comment' ? '注释' : '删除'}函数: ${funcName}`);
+          }
+        }
+      },
+      
+      VariableDeclarator(path) {
+        if (path.node.init && path.node.init.type === 'FunctionExpression') {
+          const funcName = path.node.id?.name;
+          if (funcName && safeToClean.has(funcName)) {
+            if (cleanupMode === 'comment') {
+              const functionCode = generate(path.node).code;
+              const commentedCode = `/* [解密清理] 已解密的函数表达式: ${funcName} */\n/*${functionCode.replace(/\/\*/g, '/\\*').replace(/\*\//g, '*\\/')}*/`;
+              path.replaceWithMultiple(parser.parse(commentedCode).program.body);
+            } else {
+              path.remove();
+            }
+            functionCleanupCount++;
+            
+            if (config.verbose) {
+              console.log(`  [清理] ${cleanupMode === 'comment' ? '注释' : '删除'}函数表达式: ${funcName}`);
+            }
+          }
+        }
+      }
+    });
 
     if (functionCleanupCount > 0 || immediateFunctionCleanupCount > 0) {
       console.log(`  [清理完成] ${cleanupMode === 'comment' ? '注释' : '删除'}了 ${functionCleanupCount} 个函数和 ${immediateFunctionCleanupCount} 个立即执行函数`);
