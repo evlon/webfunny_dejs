@@ -3,7 +3,10 @@
  * 确保已修复的导出检测bug不会再次出现
  */
 
-const { processWithNewStrategy } = require('../../../de.js');
+// 注意：重构后的测试需要调用模块化的API
+// 这里我们直接测试核心模块功能
+const { processWithNewStrategy } = require('../../../lib/core-processor');
+const { createConfig } = require('../../../lib/config');
 
 describe('导出检测bug回归测试', () => {
   
@@ -222,43 +225,28 @@ describe('导出检测bug回归测试', () => {
 
   // 辅助函数：处理代码并分析结果
   function processAndAnalyze(code) {
-    const fs = require('fs');
-    const path = require('path');
-    const testDir = path.join(__dirname, '../../../fixtures/temp');
-    const inputFile = path.join(testDir, 'test-input.js');
-    const outputFile = path.join(testDir, 'test-output.js');
-    
-    // 确保目录存在
-    if (!fs.existsSync(testDir)) {
-      fs.mkdirSync(testDir, { recursive: true });
-    }
-    
-    // 写入测试文件
-    fs.writeFileSync(inputFile, code, 'utf8');
-    
-    // 模拟配置
-    global.argv = {
-      file: inputFile,
-      output: outputFile,
+    // 创建配置对象
+    const config = createConfig({
+      file: 'test.js',
+      output: 'test-output.js',
       backup: false,
       verbose: false,
-      'cleanup-functions': 'comment'
-    };
+      'cleanup-functions': 'comment',
+      'intercept-pattern': 'f\\d+',
+      'string-reverse': true,
+      'function-calls': true,
+      debug: false,
+      'trace-lines': true,
+      'disable-replace': false,
+      'min-args': 4,
+      'max-args': 6
+    });
     
-    global.config = {
-      interceptPattern: /f\d+/,
-      cleanupFunctions: 'comment',
-      verbose: false
-    };
+    // 使用模块化API处理代码
+    const processedCode = processWithNewStrategy(code, 'test-output.js', config);
     
-    // 处理代码
-    const result = processWithNewStrategy(code, outputFile);
-    
-    // 读取处理结果
-    let processedCode = code; // 默认返回原代码
-    if (result && fs.existsSync(outputFile)) {
-      processedCode = fs.readFileSync(outputFile, 'utf8');
-    }
+    // 如果处理失败，返回原代码
+    const finalCode = processedCode || code;
     
     // 分析处理结果
     const analysis = {
@@ -267,40 +255,32 @@ describe('导出检测bug回归测试', () => {
       functionsToCleanup: [],
       immediateFunctionsToCleanup: new Set(),
       dependencyGraph: new Map(),
-      codeAfterProcessing: processedCode
+      codeAfterProcessing: finalCode
     };
     
     // 从处理后的代码中分析结果
     // 检测导出的函数（未被注释的）
     const exportRegex = /module\.exports\s*=\s*{[^}]*\bf(\d+)\b[^}]*}/g;
     let match;
-    while ((match = exportRegex.exec(processedCode)) !== null) {
-      const funcMatch = processedCode.match(/f\d+/g);
+    while ((match = exportRegex.exec(finalCode)) !== null) {
+      const funcMatch = finalCode.match(/f\d+/g);
       if (funcMatch) {
         analysis.exportedFunctions.push(...funcMatch);
       }
     }
     
     // 检测受保护的函数（未被注释且在业务逻辑中）
-    if (processedCode.includes('businessLogic')) {
-      const funcMatches = processedCode.match(/f\d+/g) || [];
+    if (finalCode.includes('businessLogic')) {
+      const funcMatches = finalCode.match(/f\d+/g) || [];
       analysis.protectedFunctions.push(...funcMatches);
     }
     
     // 检测被清理的函数（被注释的）
     const commentedRegex = /\/\*.*f(\d+).*\*\//g;
     let commentedMatch;
-    while ((commentedMatch = commentedRegex.exec(processedCode)) !== null) {
+    while ((commentedMatch = commentedRegex.exec(finalCode)) !== null) {
       analysis.functionsToCleanup.push(`f${commentedMatch[1]}`);
     }
-    
-    // 清理测试文件
-    if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
-    if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
-    
-    // 清理全局变量
-    delete global.argv;
-    delete global.config;
     
     return analysis;
   }
