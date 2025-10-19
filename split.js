@@ -152,19 +152,38 @@ function extractGlobalDependencies(originalCode, targetFile) {
             if (decl.id.type === 'Identifier') {
               // 单个变量声明：const fs = require('fs')
               const varName = decl.id.name;
-              const requirePath = decl.init.arguments[0].value;
-              dependencies.set(varName, {
-                type: 'require',
-                code: generate(node).code,
-                varName: varName,
-                requirePath: requirePath
-              });
+              let requirePath = decl.init.arguments[0].value;
+              
+              // 修正相对路径：当模块被移动到 sub-modules 目录时，需要调整相对路径
+              if (requirePath.startsWith('./') || requirePath.startsWith('../')) {
+                // 使用 path.join('../', requirePath) 来修正路径
+                requirePath = path.join('../', requirePath);
+                dependencies.set(varName, {
+                  type: 'require',
+                  code: `const ${varName} = require('${requirePath}');`,
+                  varName: varName,
+                  requirePath: requirePath
+                });
+              } else {
+                // 保持绝对路径或node_modules路径不变
+                dependencies.set(varName, {
+                  type: 'require',
+                  code: generate(node).code,
+                  varName: varName,
+                  requirePath: requirePath
+                });
+              }
             } else if (decl.id.type === 'ObjectPattern') {
               // 解构赋值：const { readFile, writeFile } = require('fs')
               decl.id.properties.forEach(prop => {
                 if (prop.type === 'ObjectProperty' && prop.key.type === 'Identifier') {
                   const varName = prop.key.name;
-                  const requirePath = decl.init.arguments[0].value;
+                  let requirePath = decl.init.arguments[0].value;
+                  
+                  // 修正相对路径
+                  if (requirePath.startsWith('./') || requirePath.startsWith('../')) {
+                    requirePath = path.join('../', requirePath);
+                  }
                   
                   dependencies.set(varName, {
                     type: 'require',
