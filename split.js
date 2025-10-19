@@ -417,6 +417,17 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
       // 检测标识符引用
       if (globalDependencies.has(node.name)) {
         const dep = globalDependencies.get(node.name);
+        
+        // 关键修复：跳过自引用依赖
+        if ((dep.type === 'controller_reference' || 
+             dep.type === 'controller_property_reference' ||
+             dep.type === 'controller_static_reference') && 
+            dep.sourceController === name) {
+          // 这是自引用（引用当前正在生成的类），跳过不添加依赖
+          console.log(`[DEBUG] 跳过自引用依赖: ${name} -> ${dep.sourceController} (类型: ${dep.type})`);
+          return;
+        }
+        
         usedVariables.add(node.name);
         
         // 处理不同类型的依赖
@@ -440,6 +451,7 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
                    dep.type === 'controller_static_reference') {
           // 控制器引用（实例或静态）
           usedDependencies.add(dep.varName);
+          console.log(`[DEBUG] 添加控制器引用依赖: ${name} -> ${dep.sourceController} (类型: ${dep.type})`);
         }
       } else {
         // 记录未找到依赖的变量，用于调试
@@ -566,12 +578,22 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
     if (globalDependencies.has(depName) && !addedDeps.has(depName)) {
       const dep = globalDependencies.get(depName);
       
+      // 关键修复：在最终生成阶段也过滤自引用依赖
+      if ((dep.type === 'controller_reference' || 
+           dep.type === 'controller_property_reference' ||
+           dep.type === 'controller_static_reference') && 
+          dep.sourceController === name) {
+        console.log(`[DEBUG] 在最终生成阶段跳过自引用依赖: ${name} -> ${dep.sourceController}`);
+        return;
+      }
+      
       // 对于require类型的依赖，添加相应的代码
       if (dep.type === 'require_destructured' || dep.type === 'require' || 
           dep.type === 'indirect_destructured' || 
           dep.type === 'controller_reference' || 
           dep.type === 'controller_property_reference' ||
           dep.type === 'controller_static_reference') {
+        console.log(`[DEBUG] 添加依赖代码: ${depName} (类型: ${dep.type})`);
         content += `${dep.code}\n`;
       }
       
