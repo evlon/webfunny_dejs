@@ -136,90 +136,125 @@ function analyzeControllerScript(targetFile) {
 function extractGlobalDependencies(originalCode, targetFile) {
   const ast = parseCode(originalCode);
   const dependencies = new Map(); // 变量名 -> 依赖内容
+  const variableAssignments = new Map(); // 变量名 -> 赋值内容
   
-  // 收集所有全局作用域的声明（Program的直接子节点）
+  // 第一遍：收集所有变量声明和赋值
   ast.program.body.forEach(node => {
     if (node.type === 'VariableDeclaration') {
-      // 处理全局变量声明
-      if (node.kind === 'var' || node.kind === 'let' || node.kind === 'const') {
-        node.declarations.forEach(decl => {
+      node.declarations.forEach(decl => {
+        if (decl.id.type === 'Identifier') {
+          const varName = decl.id.name;
+          
+          // 处理require语句
           if (decl.init && 
               decl.init.type === 'CallExpression' && 
               decl.init.callee.type === 'Identifier' && 
               decl.init.callee.name === 'require') {
             
-            // 处理require语句
-            if (decl.id.type === 'Identifier') {
-              // 单个变量声明：const fs = require('fs')
-              const varName = decl.id.name;
-              let requirePath = decl.init.arguments[0].value;
-              
-              // 修正相对路径：当模块被移动到 sub-modules 目录时，需要调整相对路径
-              if (requirePath.startsWith('./') || requirePath.startsWith('../')) {
-                // 使用 path.join('../', requirePath) 来修正路径
-                requirePath = path.join('../', requirePath);
-                dependencies.set(varName, {
-                  type: 'require',
-                  code: `const ${varName} = require('${requirePath}');`,
-                  varName: varName,
-                  requirePath: requirePath
-                });
-              } else {
-                // 保持绝对路径或node_modules路径不变
-                dependencies.set(varName, {
-                  type: 'require',
-                  code: generate(node).code,
-                  varName: varName,
-                  requirePath: requirePath
-                });
+            let requirePath = decl.init.arguments[0].value;
+            
+            // 修正相对路径：当模块被移动到 sub-modules 目录时，需要调整相对路径
+            if (requirePath.startsWith('./') || requirePath.startsWith('../')) {
+              requirePath = path.join('../', requirePath);
+            }
+            
+            dependencies.set(varName, {
+              type: 'require',
+              code: `const ${varName} = require('${requirePath}');`,
+              varName: varName,
+              requirePath: requirePath
+            });
+          } else {
+            // 记录其他类型的变量赋值
+            variableAssignments.set(varName, {
+              node: decl,
+              init: decl.init
+            });
+          }
+        } else if (decl.id.type === 'ObjectPattern') {
+          // 处理解构赋值
+          if (decl.init && decl.init.type === 'CallExpression' && 
+              decl.init.callee.type === 'Identifier' && 
+              decl.init.callee.name === 'require') {
+            
+            // 直接解构：const { readFile, writeFile } = require('fs')
+            let requirePath = decl.init.arguments[0].value;
+            const variables = [];
+            
+            // 收集所有解构的变量名
+            decl.id.properties.forEach(prop => {
+              if (prop.type === 'ObjectProperty' && prop.key.type === 'Identifier') {
+                const varName = prop.key.name;
+                variables.push(varName);
               }
-            } else if (decl.id.type === 'ObjectPattern') {
-              // 解构赋值：const { readFile, writeFile } = require('fs')
-              let requirePath = decl.init.arguments[0].value;
-              const variables = [];
+            });
+            
+            if (variables.length > 0) {
+              // 修正相对路径
+              if (requirePath.startsWith('./') || requirePath.startsWith('../')) {
+                requirePath = path.join('../', requirePath);
+              }
               
-              // 收集所有解构的变量名
-              decl.id.properties.forEach(prop => {
-                if (prop.type === 'ObjectProperty' && prop.key.type === 'Identifier') {
-                  const varName = prop.key.name;
-                  variables.push(varName);
-                }
+              // 为整个解构赋值生成一个依赖项
+              const depName = `destructured_${variables.join('_')}`;
+              
+              // 生成修正后的代码
+              const variableList = variables.join(', ');
+              const correctedCode = `const { ${variableList} } = require('${requirePath}');`;
+              
+              dependencies.set(depName, {
+                type: 'require_destructured',
+                code: correctedCode,
+                varName: depName,
+                requirePath: requirePath,
+                variables: variables
               });
               
-              if (variables.length > 0) {
-                // 修正相对路径
-                if (requirePath.startsWith('./') || requirePath.startsWith('../')) {
-                  requirePath = path.join('../', requirePath);
-                }
-                
-                // 为整个解构赋值生成一个依赖项，而不是每个变量一个
-                const depName = `destructured_${variables.join('_')}`;
-                
-                // 生成修正后的代码，确保路径正确
-                const variableList = variables.join(', ');
-                const correctedCode = `const { ${variableList} } = require('${requirePath}');`;
-                
-                dependencies.set(depName, {
-                  type: 'require_destructured',
-                  code: correctedCode, // 使用修正后的代码
-                  varName: depName,
-                  requirePath: requirePath,
-                  variables: variables
+              // 同时为每个变量创建映射
+              variables.forEach(varName => {
+                dependencies.set(varName, {
+                  type: 'variable_from_destructured',
+                  sourceDep: depName,
+                  varName: varName
                 });
-                
-                // 同时为每个变量创建映射，以便后续检测使用
-                variables.forEach(varName => {
-                  dependencies.set(varName, {
-                    type: 'variable_from_destructured',
-                    sourceDep: depName,
-                    varName: varName
-                  });
-                });
+              });
+            }
+          } else {
+            // 处理间接解构赋值：const { a, b } = someVariable
+            const targetVar = decl.init && decl.init.type === 'Identifier' ? decl.init.name : null;
+            const variables = [];
+            
+            decl.id.properties.forEach(prop => {
+              if (prop.type === 'ObjectProperty' && prop.key.type === 'Identifier') {
+                const varName = prop.key.name;
+                variables.push(varName);
               }
+            });
+            
+            if (targetVar && variables.length > 0) {
+              // 为整个间接解构赋值创建一个特殊的依赖项
+              const depName = `indirect_destructured_${targetVar}_${variables.join('_')}`;
+              
+              dependencies.set(depName, {
+                type: 'indirect_destructured',
+                code: `const { ${variables.join(', ')} } = ${targetVar};`,
+                varName: depName,
+                sourceVar: targetVar,
+                variables: variables
+              });
+              
+              // 为每个变量创建映射
+              variables.forEach(varName => {
+                dependencies.set(varName, {
+                  type: 'variable_from_indirect_destructured',
+                  sourceDep: depName,
+                  varName: varName
+                });
+              });
             }
           }
-        });
-      }
+        }
+      });
     }
   });
   
@@ -249,6 +284,7 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
   const controllerAst = parseCode(code);
   const usedVariables = new Set(); // 记录使用的变量名
   const usedDependencies = new Set(); // 记录使用的依赖项
+  const missingDependencies = new Set(); // 记录需要但未找到的依赖
   
   traverse(controllerAst, {
     Identifier(path) {
@@ -268,12 +304,26 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
         const dep = globalDependencies.get(node.name);
         usedVariables.add(node.name);
         
-        // 如果是解构赋值中的变量，记录其来源依赖
+        // 处理不同类型的依赖
         if (dep.type === 'variable_from_destructured') {
+          // 解构赋值中的变量
           usedDependencies.add(dep.sourceDep);
-        } else {
+        } else if (dep.type === 'variable_from_indirect_destructured') {
+          // 间接解构赋值中的变量
+          usedDependencies.add(dep.sourceDep);
+        } else if (dep.type === 'require') {
+          // 直接require的变量
           usedDependencies.add(node.name);
+        } else if (dep.type === 'require_destructured') {
+          // 解构赋值的依赖项
+          usedDependencies.add(node.name);
+        } else if (dep.type === 'indirect_destructured') {
+          // 间接解构赋值的依赖项
+          usedDependencies.add(dep.sourceVar);
         }
+      } else {
+        // 记录未找到依赖的变量，用于调试
+        missingDependencies.add(node.name);
       }
       
       // 检测成员表达式中的标识符
@@ -284,6 +334,8 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
           
           if (dep.type === 'variable_from_destructured') {
             usedDependencies.add(dep.sourceDep);
+          } else if (dep.type === 'variable_from_assignment') {
+            usedDependencies.add(dep.sourceVar);
           } else {
             usedDependencies.add(parent.object.name);
           }
@@ -292,22 +344,49 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
     }
   });
   
+  // 递归追踪间接依赖
+  const traceDependencies = (depName) => {
+    if (globalDependencies.has(depName)) {
+      const dep = globalDependencies.get(depName);
+      
+      if (dep.type === 'variable_from_assignment' && !usedDependencies.has(dep.sourceVar)) {
+        usedDependencies.add(dep.sourceVar);
+        traceDependencies(dep.sourceVar);
+      } else if (dep.type === 'indirect_destructured' && !usedDependencies.has(dep.sourceVar)) {
+        usedDependencies.add(dep.sourceVar);
+        traceDependencies(dep.sourceVar);
+      } else if (dep.type === 'variable_from_indirect_destructured' && !usedDependencies.has(dep.sourceDep)) {
+        usedDependencies.add(dep.sourceDep);
+        traceDependencies(dep.sourceDep);
+      }
+    }
+  };
+  
+  // 初次收集后，进行深度追踪
+  const initialDeps = Array.from(usedDependencies);
+  initialDeps.forEach(depName => {
+    traceDependencies(depName);
+  });
+  
   // 添加必要的依赖声明，避免重复
   const addedDeps = new Set();
   usedDependencies.forEach(depName => {
     if (globalDependencies.has(depName) && !addedDeps.has(depName)) {
       const dep = globalDependencies.get(depName);
       
-      // 对于解构赋值的依赖，使用原始代码
-      if (dep.type === 'require_destructured') {
-        content += `${dep.code}\n`;
-      } else if (dep.type === 'require') {
+      // 对于require类型的依赖，添加相应的代码
+      if (dep.type === 'require_destructured' || dep.type === 'require' || dep.type === 'indirect_destructured') {
         content += `${dep.code}\n`;
       }
       
       addedDeps.add(depName);
     }
   });
+  
+  // 调试信息
+  if (missingDependencies.size > 0) {
+    console.log(`[DEBUG] 控制器 ${name} 中未找到依赖的变量:`, Array.from(missingDependencies));
+  }
   
   if (usedDependencies.size > 0) {
     content += '\n';
