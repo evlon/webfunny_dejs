@@ -131,12 +131,15 @@ function analyzeControllerScript(targetFile) {
 }
 
 /**
- * 提取原始文件中的全局依赖（require语句、变量声明等）
+ * 提取原始文件中的全局依赖（require语句、变量声明等），包括子模块间引用
  */
-function extractGlobalDependencies(originalCode, targetFile) {
+function extractGlobalDependencies(originalCode, targetFile, allControllers) {
   const ast = parseCode(originalCode);
   const dependencies = new Map(); // 变量名 -> 依赖内容
   const variableAssignments = new Map(); // 变量名 -> 赋值内容
+  
+  // 收集所有控制器类名，用于检测子模块间引用
+  const controllerNames = new Set(allControllers ? allControllers.keys() : []);
   
   // 第一遍：收集所有变量声明和赋值
   ast.program.body.forEach(node => {
@@ -258,18 +261,130 @@ function extractGlobalDependencies(originalCode, targetFile) {
     }
   });
   
+  // 第二遍：检测子模块间引用（控制器类间的相互引用）
+  if (allControllers && controllerNames.size > 1) {
+    // 遍历整个 AST 来检测子模块间引用
+    traverse(ast, {
+      ClassDeclaration(path) {
+        const className = path.node.id?.name;
+        if (className && controllerNames.has(className)) {
+          // 在类内部查找对其他控制器的引用
+          path.traverse({
+            NewExpression(newPath) {
+              const callee = newPath.node.callee;
+              if (callee.type === 'Identifier' && controllerNames.has(callee.name)) {
+                // 检测到 new OtherController() 这种引用
+                const refControllerName = callee.name;
+                if (refControllerName !== className) {
+                  console.log(`[INFO] 检测到控制器引用: ${className} -> ${refControllerName} (NewExpression)`);
+                  // 创建子模块间引用依赖
+                  const depName = `controller_ref_${className}_to_${refControllerName}`;
+                  const modulePath = `../sub-modules/${refControllerName.toLowerCase()}`;
+                  
+                  dependencies.set(depName, {
+                    type: 'controller_reference',
+                    code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
+                    varName: refControllerName,
+                    sourceController: refControllerName,
+                    targetController: className
+                  });
+                  
+                  // 同时为控制器名称创建直接映射
+                  dependencies.set(refControllerName, {
+                    type: 'controller_reference',
+                    code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
+                    varName: refControllerName,
+                    sourceController: refControllerName,
+                    targetController: className
+                  });
+                }
+              }
+            },
+            
+            MemberExpression(memberPath) {
+              const object = memberPath.node.object;
+              const property = memberPath.node.property;
+              
+              // 检测 this.otherController.method() 这种引用
+              if (object.type === 'ThisExpression' && 
+                  property.type === 'Identifier' && 
+                  controllerNames.has(property.name)) {
+                const refControllerName = property.name;
+                if (refControllerName !== className) {
+                  console.log(`[INFO] 检测到控制器属性引用: ${className} -> ${refControllerName} (MemberExpression)`);
+                  // 创建子模块间引用依赖
+                  const depName = `controller_property_ref_${className}_to_${refControllerName}`;
+                  const modulePath = `../sub-modules/${refControllerName.toLowerCase()}`;
+                  
+                  dependencies.set(depName, {
+                    type: 'controller_property_reference',
+                    code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
+                    varName: refControllerName,
+                    sourceController: refControllerName,
+                    targetController: className
+                  });
+                  
+                  // 同时为控制器名称创建直接映射
+                  dependencies.set(refControllerName, {
+                    type: 'controller_property_reference',
+                    code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
+                    varName: refControllerName,
+                    sourceController: refControllerName,
+                    targetController: className
+                  });
+                }
+              }
+              
+              // 检测静态方法引用：OtherController.staticMethod()
+              if (object.type === 'Identifier' && 
+                  controllerNames.has(object.name) &&
+                  memberPath.parent.type !== 'NewExpression') {
+                const refControllerName = object.name;
+                if (refControllerName !== className) {
+                  console.log(`[INFO] 检测到静态方法引用: ${className} -> ${refControllerName} (MemberExpression)`);
+                  // 创建子模块间引用依赖
+                  const depName = `controller_static_ref_${className}_to_${refControllerName}`;
+                  const modulePath = `../sub-modules/${refControllerName.toLowerCase()}`;
+                  
+                  dependencies.set(depName, {
+                    type: 'controller_static_reference',
+                    code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
+                    varName: refControllerName,
+                    sourceController: refControllerName,
+                    targetController: className
+                  });
+                  
+                  // 同时为控制器名称创建直接映射（确保变量名被正确记录）
+                  if (!dependencies.has(refControllerName)) {
+                    dependencies.set(refControllerName, {
+                      type: 'controller_static_reference',
+                      code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
+                      varName: refControllerName,
+                      sourceController: refControllerName,
+                      targetController: className
+                    });
+                  }
+                }
+              }
+            }
+          });
+        }
+      }
+    });
+  }
+  
   return dependencies;
 }
 
 /**
- * 生成独立的控制器模块（修复循环依赖问题）
+ * 生成独立的控制器模块（支持子模块间引用）
  */
-function generateControllerModule(controllerInfo, allRequiredModules, targetFile, originalCode) {
+function generateControllerModule(controllerInfo, allRequiredModules, targetFile, originalCode, allControllers) {
   const { name, code } = controllerInfo;
   
   let content = `/**
- * ${name} 控制器模块 - 独立版本
- * 只包含该控制器相关的代码和依赖
+ * ${name} 控制器模块 - 支持子模块间引用版本
+ * 包含该控制器相关的代码、依赖和子模块引用
  */
 
 `;
@@ -277,8 +392,8 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
   // 计算基础路径：目标文件所在目录
   const targetDir = path.dirname(targetFile);
   
-  // 分析原始文件中的全局依赖
-  const globalDependencies = extractGlobalDependencies(originalCode, targetFile);
+  // 分析原始文件中的全局依赖，包括子模块间引用
+  const globalDependencies = extractGlobalDependencies(originalCode, targetFile, allControllers);
   
   // 分析控制器代码中实际使用的依赖
   const controllerAst = parseCode(code);
@@ -320,6 +435,11 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
         } else if (dep.type === 'indirect_destructured') {
           // 间接解构赋值的依赖项
           usedDependencies.add(dep.sourceVar);
+        } else if (dep.type === 'controller_reference' || 
+                   dep.type === 'controller_property_reference' ||
+                   dep.type === 'controller_static_reference') {
+          // 控制器引用（实例或静态）
+          usedDependencies.add(dep.varName);
         }
       } else {
         // 记录未找到依赖的变量，用于调试
@@ -358,6 +478,11 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
       } else if (dep.type === 'variable_from_indirect_destructured' && !usedDependencies.has(dep.sourceDep)) {
         usedDependencies.add(dep.sourceDep);
         traceDependencies(dep.sourceDep);
+      } else if ((dep.type === 'controller_reference' || 
+                  dep.type === 'controller_property_reference' ||
+                  dep.type === 'controller_static_reference') &&
+                 !usedDependencies.has(dep.varName)) {
+        usedDependencies.add(dep.varName);
       }
     }
   };
@@ -390,6 +515,9 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
     } else if (dep.type === 'variable_from_indirect_destructured' && globalDependencies.has(dep.sourceDep)) {
       dependencyGraph.get(depName).add(dep.sourceDep);
       buildDependencyGraph(dep.sourceDep);
+    } else if (dep.type === 'controller_reference' || dep.type === 'controller_property_reference') {
+      // 控制器引用不添加依赖关系，避免循环依赖
+      console.log(`[INFO] 控制器 ${name} 引用了控制器 ${dep.sourceController}`);
     }
   };
   
@@ -439,7 +567,11 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
       const dep = globalDependencies.get(depName);
       
       // 对于require类型的依赖，添加相应的代码
-      if (dep.type === 'require_destructured' || dep.type === 'require' || dep.type === 'indirect_destructured') {
+      if (dep.type === 'require_destructured' || dep.type === 'require' || 
+          dep.type === 'indirect_destructured' || 
+          dep.type === 'controller_reference' || 
+          dep.type === 'controller_property_reference' ||
+          dep.type === 'controller_static_reference') {
         content += `${dep.code}\n`;
       }
       
@@ -553,7 +685,7 @@ function splitControllerScript(targetFile, outputDir, options = {}) {
     controllers.forEach((controllerInfo, className) => {
       const fileName = `${className.toLowerCase()}.js`;
       
-      const content = generateControllerModule(controllerInfo, analysis.requiredModules, targetFile, analysis.code);
+      const content = generateControllerModule(controllerInfo, analysis.requiredModules, targetFile, analysis.code, controllers);
       
       splitModules.set(className, {
         moduleName: className.toLowerCase(),
