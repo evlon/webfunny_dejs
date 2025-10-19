@@ -175,24 +175,47 @@ function extractGlobalDependencies(originalCode, targetFile) {
               }
             } else if (decl.id.type === 'ObjectPattern') {
               // 解构赋值：const { readFile, writeFile } = require('fs')
+              let requirePath = decl.init.arguments[0].value;
+              const variables = [];
+              
+              // 收集所有解构的变量名
               decl.id.properties.forEach(prop => {
                 if (prop.type === 'ObjectProperty' && prop.key.type === 'Identifier') {
                   const varName = prop.key.name;
-                  let requirePath = decl.init.arguments[0].value;
-                  
-                  // 修正相对路径
-                  if (requirePath.startsWith('./') || requirePath.startsWith('../')) {
-                    requirePath = path.join('../', requirePath);
-                  }
-                  
-                  dependencies.set(varName, {
-                    type: 'require',
-                    code: `const ${varName} = require('${requirePath}');`,
-                    varName: varName,
-                    requirePath: requirePath
-                  });
+                  variables.push(varName);
                 }
               });
+              
+              if (variables.length > 0) {
+                // 修正相对路径
+                if (requirePath.startsWith('./') || requirePath.startsWith('../')) {
+                  requirePath = path.join('../', requirePath);
+                }
+                
+                // 为整个解构赋值生成一个依赖项，而不是每个变量一个
+                const depName = `destructured_${variables.join('_')}`;
+                
+                // 生成修正后的代码，确保路径正确
+                const variableList = variables.join(', ');
+                const correctedCode = `const { ${variableList} } = require('${requirePath}');`;
+                
+                dependencies.set(depName, {
+                  type: 'require_destructured',
+                  code: correctedCode, // 使用修正后的代码
+                  varName: depName,
+                  requirePath: requirePath,
+                  variables: variables
+                });
+                
+                // 同时为每个变量创建映射，以便后续检测使用
+                variables.forEach(varName => {
+                  dependencies.set(varName, {
+                    type: 'variable_from_destructured',
+                    sourceDep: depName,
+                    varName: varName
+                  });
+                });
+              }
             }
           }
         });
@@ -224,7 +247,8 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
   
   // 分析控制器代码中实际使用的依赖
   const controllerAst = parseCode(code);
-  const usedDependencies = new Set();
+  const usedVariables = new Set(); // 记录使用的变量名
+  const usedDependencies = new Set(); // 记录使用的依赖项
   
   traverse(controllerAst, {
     Identifier(path) {
@@ -241,23 +265,47 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
       
       // 检测标识符引用
       if (globalDependencies.has(node.name)) {
-        usedDependencies.add(node.name);
+        const dep = globalDependencies.get(node.name);
+        usedVariables.add(node.name);
+        
+        // 如果是解构赋值中的变量，记录其来源依赖
+        if (dep.type === 'variable_from_destructured') {
+          usedDependencies.add(dep.sourceDep);
+        } else {
+          usedDependencies.add(node.name);
+        }
       }
       
       // 检测成员表达式中的标识符
       if (parent.type === 'MemberExpression' && parent.property === node) {
         if (parent.object.type === 'Identifier' && globalDependencies.has(parent.object.name)) {
-          usedDependencies.add(parent.object.name);
+          const dep = globalDependencies.get(parent.object.name);
+          usedVariables.add(parent.object.name);
+          
+          if (dep.type === 'variable_from_destructured') {
+            usedDependencies.add(dep.sourceDep);
+          } else {
+            usedDependencies.add(parent.object.name);
+          }
         }
       }
     }
   });
   
-  // 添加必要的依赖声明
+  // 添加必要的依赖声明，避免重复
+  const addedDeps = new Set();
   usedDependencies.forEach(depName => {
-    if (globalDependencies.has(depName)) {
+    if (globalDependencies.has(depName) && !addedDeps.has(depName)) {
       const dep = globalDependencies.get(depName);
-      content += `${dep.code}\n`;
+      
+      // 对于解构赋值的依赖，使用原始代码
+      if (dep.type === 'require_destructured') {
+        content += `${dep.code}\n`;
+      } else if (dep.type === 'require') {
+        content += `${dep.code}\n`;
+      }
+      
+      addedDeps.add(depName);
     }
   });
   
