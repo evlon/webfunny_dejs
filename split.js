@@ -368,9 +368,73 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
     traceDependencies(depName);
   });
   
-  // 添加必要的依赖声明，避免重复
-  const addedDeps = new Set();
+  // 构建依赖关系图并进行拓扑排序
+  const dependencyGraph = new Map();
+  const visited = new Set();
+  
+  // 构建依赖关系
+  const buildDependencyGraph = (depName) => {
+    if (visited.has(depName) || !globalDependencies.has(depName)) return;
+    
+    visited.add(depName);
+    const dep = globalDependencies.get(depName);
+    
+    if (!dependencyGraph.has(depName)) {
+      dependencyGraph.set(depName, new Set());
+    }
+    
+    // 添加依赖关系
+    if (dep.type === 'indirect_destructured' && globalDependencies.has(dep.sourceVar)) {
+      dependencyGraph.get(depName).add(dep.sourceVar);
+      buildDependencyGraph(dep.sourceVar);
+    } else if (dep.type === 'variable_from_indirect_destructured' && globalDependencies.has(dep.sourceDep)) {
+      dependencyGraph.get(depName).add(dep.sourceDep);
+      buildDependencyGraph(dep.sourceDep);
+    }
+  };
+  
+  // 为所有使用的依赖项构建依赖图
+  usedDependencies.forEach(depName => buildDependencyGraph(depName));
+  
+  // 拓扑排序函数
+  const topologicalSort = (graph) => {
+    const visited = new Set();
+    const result = [];
+    
+    const visit = (node) => {
+      if (visited.has(node)) return;
+      visited.add(node);
+      
+      if (graph.has(node)) {
+        for (const dependency of graph.get(node)) {
+          visit(dependency);
+        }
+      }
+      
+      result.push(node);
+    };
+    
+    // 从所有节点开始遍历
+    for (const node of graph.keys()) {
+      visit(node);
+    }
+    
+    return result;
+  };
+  
+  // 获取排序后的依赖项
+  const sortedDependencies = topologicalSort(dependencyGraph);
+  
+  // 添加未在依赖图中的直接依赖
   usedDependencies.forEach(depName => {
+    if (!sortedDependencies.includes(depName) && globalDependencies.has(depName)) {
+      sortedDependencies.push(depName);
+    }
+  });
+  
+  // 按照排序后的顺序添加依赖声明
+  const addedDeps = new Set();
+  sortedDependencies.forEach(depName => {
     if (globalDependencies.has(depName) && !addedDeps.has(depName)) {
       const dep = globalDependencies.get(depName);
       
@@ -562,5 +626,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  splitControllerScript
+  splitControllerScript,
+  extractGlobalDependencies, 
+  analyzeControllerScript
 };
