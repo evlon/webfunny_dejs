@@ -137,6 +137,7 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
   const ast = parseCode(originalCode);
   const dependencies = new Map(); // 变量名 -> 依赖内容
   const variableAssignments = new Map(); // 变量名 -> 赋值内容
+  const globalDeclarations = new Map(); // 全局声明（变量、函数等）
   
   // 收集所有控制器类名，用于检测子模块间引用
   const controllerNames = new Set(allControllers ? allControllers.keys() : []);
@@ -261,7 +262,74 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
     }
   });
   
-  // 第二遍：检测子模块间引用（控制器类间的相互引用）
+  // 第二遍：收集全局声明（变量、函数等）
+  ast.program.body.forEach(node => {
+    // 收集变量声明
+    if (node.type === 'VariableDeclaration') {
+      node.declarations.forEach(decl => {
+        if (decl.id.type === 'Identifier') {
+          const varName = decl.id.name;
+          
+          // 跳过控制器类名的声明（这些会被单独处理）
+          if (controllerNames.has(varName)) {
+            return;
+          }
+          
+          // 关键修复：跳过已经被当作依赖处理的require变量
+          if (dependencies.has(varName)) {
+            const dep = dependencies.get(varName);
+            if (dep.type === 'require' || dep.type === 'require_destructured') {
+              console.log(`[DEBUG] 跳过require变量声明（已在依赖中）: ${varName}`);
+              return;
+            }
+          }
+          
+          // 收集全局变量声明
+          const declarationCode = generate(node).code;
+          globalDeclarations.set(varName, {
+            type: 'variable_declaration',
+            code: declarationCode,
+            varName: varName,
+            node: node
+          });
+          
+          console.log(`[DEBUG] 收集全局变量声明: ${varName}`);
+        }
+      });
+    }
+    
+    // 收集函数声明
+    if (node.type === 'FunctionDeclaration') {
+      const funcName = node.id?.name;
+      if (funcName) {
+        // 跳过控制器类名的方法声明
+        if (controllerNames.has(funcName)) {
+          return;
+        }
+        
+        // 关键修复：跳过已经被当作依赖处理的require变量
+        if (dependencies.has(funcName)) {
+          const dep = dependencies.get(funcName);
+          if (dep.type === 'require' || dep.type === 'require_destructured') {
+            console.log(`[DEBUG] 跳过require函数声明（已在依赖中）: ${funcName}`);
+            return;
+          }
+        }
+        
+        const declarationCode = generate(node).code;
+        globalDeclarations.set(funcName, {
+          type: 'function_declaration',
+          code: declarationCode,
+          varName: funcName,
+          node: node
+        });
+        
+        console.log(`[DEBUG] 收集全局函数声明: ${funcName}`);
+      }
+    }
+  });
+
+  // 第三遍：检测子模块间引用（控制器类间的相互引用）
   if (allControllers && controllerNames.size > 1) {
     // 遍历整个 AST 来检测子模块间引用
     traverse(ast, {
@@ -373,7 +441,10 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
     });
   }
   
-  return dependencies;
+  return {
+    dependencies,
+    globalDeclarations
+  };
 }
 
 /**
@@ -393,7 +464,9 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
   const targetDir = path.dirname(targetFile);
   
   // 分析原始文件中的全局依赖，包括子模块间引用
-  const globalDependencies = extractGlobalDependencies(originalCode, targetFile, allControllers);
+  const dependencyResult = extractGlobalDependencies(originalCode, targetFile, allControllers);
+  const globalDependencies = dependencyResult.dependencies;
+  const globalDeclarations = dependencyResult.globalDeclarations;
   
   // 分析控制器代码中实际使用的依赖
   const controllerAst = parseCode(code);
@@ -572,7 +645,62 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
     }
   });
   
-  // 按照排序后的顺序添加依赖声明
+  // 第一步：添加全局变量声明（在依赖之前）
+  const usedGlobalDeclarations = new Set();
+  
+  // 遍历使用的依赖，找出需要哪些全局声明
+  usedDependencies.forEach(depName => {
+    if (globalDeclarations.has(depName)) {
+      usedGlobalDeclarations.add(depName);
+    }
+  });
+  
+  // 同时检查控制器代码中直接使用的全局变量
+  traverse(controllerAst, {
+    Identifier(path) {
+      const node = path.node;
+      const parent = path.parent;
+      
+      // 跳过函数声明和变量声明中的标识符
+      if (parent.type === 'FunctionDeclaration' || 
+          parent.type === 'VariableDeclarator' ||
+          parent.type === 'ClassDeclaration' ||
+          parent.type === 'MethodDefinition') {
+        return;
+      }
+      
+      // 如果这个标识符有全局声明，就标记为需要
+      if (globalDeclarations.has(node.name)) {
+        usedGlobalDeclarations.add(node.name);
+      }
+    }
+  });
+  
+  // 关键修复：过滤掉已经作为依赖处理的声明
+  const filteredGlobalDeclarations = new Set();
+  usedGlobalDeclarations.forEach(declName => {
+    // 如果这个声明已经在依赖中处理了，就跳过
+    if (usedDependencies.has(declName)) {
+      console.log(`[DEBUG] 跳过已在依赖中处理的声明: ${declName}`);
+      return;
+    }
+    filteredGlobalDeclarations.add(declName);
+  });
+  
+  // 添加全局声明到内容中（在依赖之前）
+  if (filteredGlobalDeclarations.size > 0) {
+    content += '// 全局声明\n';
+    filteredGlobalDeclarations.forEach(declName => {
+      if (globalDeclarations.has(declName)) {
+        const decl = globalDeclarations.get(declName);
+        content += `${decl.code}\n`;
+        console.log(`[DEBUG] 添加全局声明: ${declName} (类型: ${decl.type})`);
+      }
+    });
+    content += '\n';
+  }
+  
+  // 第二步：按照排序后的顺序添加依赖声明
   const addedDeps = new Set();
   sortedDependencies.forEach(depName => {
     if (globalDependencies.has(depName) && !addedDeps.has(depName)) {
