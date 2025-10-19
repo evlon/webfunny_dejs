@@ -131,49 +131,123 @@ function analyzeControllerScript(targetFile) {
 }
 
 /**
- * 生成控制器模块文件
+ * 提取原始文件中的全局依赖（require语句、变量声明等）
  */
-function generateControllerModule(controllerInfo, allRequiredModules) {
+function extractGlobalDependencies(originalCode, targetFile) {
+  const ast = parseCode(originalCode);
+  const dependencies = new Map(); // 变量名 -> 依赖内容
+  
+  // 收集所有全局作用域的声明（Program的直接子节点）
+  ast.program.body.forEach(node => {
+    if (node.type === 'VariableDeclaration') {
+      // 处理全局变量声明
+      if (node.kind === 'var' || node.kind === 'let' || node.kind === 'const') {
+        node.declarations.forEach(decl => {
+          if (decl.init && 
+              decl.init.type === 'CallExpression' && 
+              decl.init.callee.type === 'Identifier' && 
+              decl.init.callee.name === 'require') {
+            
+            // 处理require语句
+            if (decl.id.type === 'Identifier') {
+              // 单个变量声明：const fs = require('fs')
+              const varName = decl.id.name;
+              const requirePath = decl.init.arguments[0].value;
+              dependencies.set(varName, {
+                type: 'require',
+                code: generate(node).code,
+                varName: varName,
+                requirePath: requirePath
+              });
+            } else if (decl.id.type === 'ObjectPattern') {
+              // 解构赋值：const { readFile, writeFile } = require('fs')
+              decl.id.properties.forEach(prop => {
+                if (prop.type === 'ObjectProperty' && prop.key.type === 'Identifier') {
+                  const varName = prop.key.name;
+                  const requirePath = decl.init.arguments[0].value;
+                  
+                  dependencies.set(varName, {
+                    type: 'require',
+                    code: `const ${varName} = require('${requirePath}');`,
+                    varName: varName,
+                    requirePath: requirePath
+                  });
+                }
+              });
+            }
+          }
+        });
+      }
+    }
+  });
+  
+  return dependencies;
+}
+
+/**
+ * 生成独立的控制器模块（修复循环依赖问题）
+ */
+function generateControllerModule(controllerInfo, allRequiredModules, targetFile, originalCode) {
   const { name, code } = controllerInfo;
   
   let content = `/**
- * ${name} 控制器模块
- * 从加密脚本拆分出来的独立控制器类
+ * ${name} 控制器模块 - 独立版本
+ * 只包含该控制器相关的代码和依赖
  */
 
 `;
   
-  // 添加必要的require语句
-  const dependenciesToAdd = new Set();
+  // 计算基础路径：目标文件所在目录
+  const targetDir = path.dirname(targetFile);
   
-  // 检查代码中使用了哪些模块
-  allRequiredModules.forEach(modulePath => {
-    const moduleName = path.basename(modulePath, path.extname(modulePath));
-    
-    if (code.includes(`${moduleName}.`) || 
-        (modulePath === 'moment' && code.includes('moment.')) ||
-        (modulePath === 'fs' && code.includes('fs.')) ||
-        (modulePath === 'node-fetch' && code.includes('fetch')) ||
-        (modulePath === 'jsonwebtoken' && code.includes('jwt')) ||
-        (modulePath === 'crypto' && code.includes('crypto.'))) {
-      dependenciesToAdd.add(modulePath);
+  // 分析原始文件中的全局依赖
+  const globalDependencies = extractGlobalDependencies(originalCode, targetFile);
+  
+  // 分析控制器代码中实际使用的依赖
+  const controllerAst = parseCode(code);
+  const usedDependencies = new Set();
+  
+  traverse(controllerAst, {
+    Identifier(path) {
+      const node = path.node;
+      const parent = path.parent;
+      
+      // 跳过函数声明和变量声明中的标识符
+      if (parent.type === 'FunctionDeclaration' || 
+          parent.type === 'VariableDeclarator' ||
+          parent.type === 'ClassDeclaration' ||
+          parent.type === 'MethodDefinition') {
+        return;
+      }
+      
+      // 检测标识符引用
+      if (globalDependencies.has(node.name)) {
+        usedDependencies.add(node.name);
+      }
+      
+      // 检测成员表达式中的标识符
+      if (parent.type === 'MemberExpression' && parent.property === node) {
+        if (parent.object.type === 'Identifier' && globalDependencies.has(parent.object.name)) {
+          usedDependencies.add(parent.object.name);
+        }
+      }
     }
   });
   
-  // 添加require语句
-  if (dependenciesToAdd.size > 0) {
-    dependenciesToAdd.forEach(modulePath => {
-      const moduleName = path.basename(modulePath, path.extname(modulePath));
-      if (modulePath.startsWith('./') || modulePath.startsWith('../')) {
-        content += `const ${moduleName} = require('${modulePath}');\n`;
-      } else {
-        content += `const ${moduleName} = require('${modulePath}');\n`;
-      }
-    });
+  // 添加必要的依赖声明
+  usedDependencies.forEach(depName => {
+    if (globalDependencies.has(depName)) {
+      const dep = globalDependencies.get(depName);
+      content += `${dep.code}\n`;
+    }
+  });
+  
+  if (usedDependencies.size > 0) {
     content += '\n';
   }
   
-  // 添加控制器类代码
+  // 只添加当前控制器类的代码
+  content += `// ${name} 控制器类\n`;
   content += `${code}\n\n`;
   
   // 导出控制器类
@@ -190,14 +264,14 @@ function generateMainEntryFile(splitModules, originalFile) {
  * 控制器脚本拆分后的主入口文件
  * 原始文件: ${path.basename(originalFile)}
  * 拆分时间: ${new Date().toISOString()}
- * 控制器模块目录: controller-modules/
+ * 控制器模块目录: sub-modules/
  */
 
 `;
   
   // 添加所有控制器模块的require
   splitModules.forEach((moduleInfo, className) => {
-    const modulePath = `./controller-modules/${moduleInfo.fileName.replace('.js', '')}`;
+    const modulePath = `./sub-modules/${moduleInfo.fileName.replace('.js', '')}`;
     content += `const ${moduleInfo.moduleName} = require('${modulePath}');\n`;
   });
   
@@ -254,14 +328,14 @@ function splitControllerScript(targetFile, outputDir, options = {}) {
     }
     
     // 子模块目录路径
-    const subModulesDir = path.join(outputDir, 'controller-modules');
+    const subModulesDir = path.join(outputDir, 'sub-modules');
     
     // 确保目录存在
     if (!fs.existsSync(subModulesDir)) {
       fs.mkdirSync(subModulesDir, { recursive: true });
     }
     
-    console.log(`准备拆分 ${controllers.size} 个控制器到 controller-modules 目录`);
+    console.log(`准备拆分 ${controllers.size} 个控制器到 sub-modules 目录`);
     
     // 生成控制器模块
     const splitModules = new Map();
@@ -269,7 +343,7 @@ function splitControllerScript(targetFile, outputDir, options = {}) {
     controllers.forEach((controllerInfo, className) => {
       const fileName = `${className.toLowerCase()}.js`;
       
-      const content = generateControllerModule(controllerInfo, analysis.requiredModules);
+      const content = generateControllerModule(controllerInfo, analysis.requiredModules, targetFile, analysis.code);
       
       splitModules.set(className, {
         moduleName: className.toLowerCase(),
@@ -284,7 +358,7 @@ function splitControllerScript(targetFile, outputDir, options = {}) {
     splitModules.forEach((moduleInfo, className) => {
       const filePath = path.join(subModulesDir, moduleInfo.fileName);
       fs.writeFileSync(filePath, moduleInfo.content, 'utf8');
-      console.log(`生成控制器模块: controller-modules/${moduleInfo.fileName} (${className})`);
+      console.log(`生成控制器模块: sub-modules/${moduleInfo.fileName} (${className})`);
     });
     
     // 生成主入口文件
@@ -294,7 +368,7 @@ function splitControllerScript(targetFile, outputDir, options = {}) {
     console.log(`生成主入口文件: ${path.basename(targetFile)}`);
     
     console.log(`\n✅ 控制器拆分完成！`);
-    console.log(`- 拆分了 ${splitModules.size} 个控制器到 controller-modules 目录`);
+    console.log(`- 拆分了 ${splitModules.size} 个控制器到 sub-modules 目录`);
     console.log(`- 主入口文件: ${path.basename(targetFile)}（保持原文件名）`);
     console.log(`- 原有引用可以继续使用 require('./${path.basename(targetFile)}')`);
     
@@ -321,9 +395,9 @@ if (require.main === module) {
   const args = process.argv.slice(2);
   
   if (args.length < 1) {
-    console.log('用法: node controller-split-v2.js <目标加密脚本> [输出目录]');
-    console.log('示例: node controller-split-v2.js 目标-加密-脚本.js');
-    console.log('       node controller-split-v2.js 目标-加密-脚本.js ./controller-result');
+    console.log('用法: node split.js <目标加密脚本> [输出目录]');
+    console.log('示例: node split.js 目标-加密-脚本.js');
+    console.log('       node split.js 目标-加密-脚本.js ./controller-result');
     process.exit(1);
   }
   
