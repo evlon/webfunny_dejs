@@ -3,16 +3,15 @@
  * 测试函数定义提取、立即执行函数提取、常量参数提取等功能
  */
 
-const {
-  extractFunctionDefinitions,
-  extractImmediateFunctions,
-  extractConstantArguments,
-  extractActualFunctionCalls,
-  shouldInterceptFunction
-} = require('../../../de.js');
+const { extractFunctionDefinitions } = require('../../../lib/core-processor');
+const { extractImmediateFunctions } = require('../../../lib/function-testing');
+const { extractConstantArguments } = require('../../../lib/ast-utils');
+const { extractActualFunctionCalls } = require('../../../lib/function-testing');
+const { shouldInterceptFunction } = require('../../../lib/config');
 
 const parser = require('@babel/parser');
 
+const mockConfig = { interceptPattern: /f\d*/,functionNamePattern: /f\d*/};
 describe('函数提取工具功能单元测试', () => {
   
   describe('函数定义提取', () => {
@@ -22,7 +21,8 @@ describe('函数提取工具功能单元测试', () => {
         function f2(c, d) { return c * d; }
       `;
       
-      const result = extractFunctionDefinitions(code);
+
+      const result = extractFunctionDefinitions(code, mockConfig);
       expect(result.functions).toContain('f1');
       expect(result.functions).toContain('f2');
       expect(result.functionCodeMap.has('f1')).toBe(true);
@@ -35,7 +35,7 @@ describe('函数提取工具功能单元测试', () => {
         const f2 = function(c, d) { return c * d; };
       `;
       
-      const result = extractFunctionDefinitions(code);
+      const result = extractFunctionDefinitions(code,mockConfig);
       expect(result.functions).toContain('f1');
       expect(result.functions).toContain('f2');
     });
@@ -46,7 +46,7 @@ describe('函数提取工具功能单元测试', () => {
         function f123(a, b) { return a + b; }
       `;
       
-      const result = extractFunctionDefinitions(code);
+      const result = extractFunctionDefinitions(code,mockConfig);
       expect(result.functions).toContain('f123');
       expect(result.functions).not.toContain('normalFunction');
     });
@@ -60,7 +60,7 @@ describe('函数提取工具功能单元测试', () => {
         })();
       `;
       
-      const result = extractImmediateFunctions(code);
+      const result = extractImmediateFunctions(code, mockConfig);
       expect(result.functions).toHaveLength(1);
       expect(result.functions[0]).toContain('立即执行函数');
     });
@@ -72,7 +72,7 @@ describe('函数提取工具功能单元测试', () => {
         }();
       `;
       
-      const result = extractImmediateFunctions(code);
+      const result = extractImmediateFunctions(code, mockConfig);
       expect(result.functions).toHaveLength(1);
     });
 
@@ -83,7 +83,7 @@ describe('函数提取工具功能单元测试', () => {
         }();
       `;
       
-      const result = extractImmediateFunctions(code);
+      const result = extractImmediateFunctions(code, mockConfig);
       expect(result.functions).toHaveLength(1);
     });
 
@@ -95,7 +95,7 @@ describe('函数提取工具功能单元测试', () => {
         })();
       `;
       
-      const result = extractImmediateFunctions(code);
+      const result = extractImmediateFunctions(code, mockConfig);
       expect(result.dependencies.has('f1')).toBe(true);
       expect(result.dependencies.has('f2')).toBe(true);
     });
@@ -164,7 +164,7 @@ describe('函数提取工具功能单元测试', () => {
         f2(true, false);
       `;
       
-      const calls = extractActualFunctionCalls(code);
+      const calls = extractActualFunctionCalls(code, mockConfig);
       expect(calls).toHaveLength(2);
       
       const f1Call = calls.find(call => call.funcName === 'f1');
@@ -185,7 +185,7 @@ describe('函数提取工具功能单元测试', () => {
         f2(3, 4);    // 正常调用
       `;
       
-      const calls = extractActualFunctionCalls(code);
+      const calls = extractActualFunctionCalls(code, mockConfig);
       
       // 只应该提取f2的调用
       const f1Call = calls.find(call => call.funcName === 'f1');
@@ -202,7 +202,8 @@ describe('函数提取工具功能单元测试', () => {
         };
       `;
       
-      const calls = extractActualFunctionCalls(code);
+      const calls = extractActualFunctionCalls(code, mockConfig);
+      // 在对象属性中，应该只找到1个调用
       expect(calls).toHaveLength(1);
       expect(calls[0].funcName).toBe('f1');
     });
@@ -212,7 +213,8 @@ describe('函数提取工具功能单元测试', () => {
         const arr = [f1(1, 2), f2(3, 4)];
       `;
       
-      const calls = extractActualFunctionCalls(code);
+      const calls = extractActualFunctionCalls(code, mockConfig);
+      // 在数组中，应该只找到2个调用（每个元素一个）
       expect(calls).toHaveLength(2);
       expect(calls[0].funcName).toBe('f1');
       expect(calls[1].funcName).toBe('f2');
@@ -223,7 +225,8 @@ describe('函数提取工具功能单元测试', () => {
         const result = f1(1, 2);
       `;
       
-      const calls = extractActualFunctionCalls(code);
+      const calls = extractActualFunctionCalls(code, mockConfig);
+      // 在赋值表达式中，应该只找到1个调用
       expect(calls).toHaveLength(1);
       expect(calls[0].funcName).toBe('f1');
     });
@@ -233,7 +236,8 @@ describe('函数提取工具功能单元测试', () => {
         const result = f1(1, 2);
       `;
       
-      const calls = extractActualFunctionCalls(code);
+      const calls = extractActualFunctionCalls(code, mockConfig);
+      // 在变量声明中，应该只找到1个调用
       expect(calls).toHaveLength(1);
       expect(calls[0].funcName).toBe('f1');
     });
@@ -242,7 +246,7 @@ describe('函数提取工具功能单元测试', () => {
   describe('函数拦截检测', () => {
     test('应该拦截匹配模式的函数', () => {
       const config = {
-        interceptPattern: /f\\d+/,
+        interceptPattern: /f\d+/,
         functionNamePattern: null,
         minArgs: 2,
         maxArgs: 4
@@ -251,13 +255,13 @@ describe('函数提取工具功能单元测试', () => {
       // 模拟全局config
       global.config = config;
       
-      expect(shouldInterceptFunction('f123', 3)).toBe(true);
-      expect(shouldInterceptFunction('normalFunction', 3)).toBe(false);
+      expect(shouldInterceptFunction(config,'f123', 3)).toBe(true);
+      expect(shouldInterceptFunction(config,'normalFunction', 3)).toBe(false);
     });
 
     test('应该检查参数数量范围', () => {
       const config = {
-        interceptPattern: /f\\d+/,
+        interceptPattern: /f\d+/,
         functionNamePattern: null,
         minArgs: 2,
         maxArgs: 4
@@ -265,14 +269,14 @@ describe('函数提取工具功能单元测试', () => {
       
       global.config = config;
       
-      expect(shouldInterceptFunction('f123', 3)).toBe(true);
-      expect(shouldInterceptFunction('f123', 1)).toBe(true); // 放宽限制
-      expect(shouldInterceptFunction('f123', 5)).toBe(true); // 放宽限制
+      expect(shouldInterceptFunction(config,'f123', 3)).toBe(true);
+      expect(shouldInterceptFunction(config,'f123', 1)).toBe(true); // 放宽限制
+      expect(shouldInterceptFunction(config,'f123', 5)).toBe(true); // 放宽限制
     });
 
     test('应该优先检查函数名模式', () => {
       const config = {
-        interceptPattern: /f\\d+/,
+        interceptPattern: /f\d+/,
         functionNamePattern: /^f123$/,
         minArgs: 2,
         maxArgs: 4
@@ -280,8 +284,8 @@ describe('函数提取工具功能单元测试', () => {
       
       global.config = config;
       
-      expect(shouldInterceptFunction('f123', 3)).toBe(true);
-      expect(shouldInterceptFunction('f456', 3)).toBe(false); // 不匹配函数名模式
+      expect(shouldInterceptFunction(config,'f123', 3)).toBe(true);
+      expect(shouldInterceptFunction(config,'f456', 3)).toBe(false); // 不匹配函数名模式
     });
   });
 });

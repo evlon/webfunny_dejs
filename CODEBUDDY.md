@@ -72,7 +72,7 @@ const config = {
   decryptFunctionCalls: true,       // Process function calls
   verbose: false,                   // Verbose output
   debug: false,                     // Debug mode with tracing
-  interceptPattern: /f\d+/,         // Function name pattern
+  interceptPattern: /f\d*/,         // Function name pattern
   minArgs: 4,                       // Minimum function arguments
   maxArgs: 6,                       // Maximum function arguments
   cleanupFunctions: 'none'          // Function cleanup mode

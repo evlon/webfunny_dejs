@@ -48,6 +48,10 @@
     ],
     "coverageDirectory": "coverage",
     "testEnvironment": "node",
+    "transformIgnorePatterns": [],
+    "transform": {
+      "^.+\\.js$": "babel-jest"
+    },
     "transformIgnorePatterns": [
       "node_modules/(?!(@babel|yargs/build)/)"
     ],

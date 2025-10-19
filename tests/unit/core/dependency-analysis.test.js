@@ -7,10 +7,13 @@ const {
   collectParameterDependencies,
   collectInitializationFunctionCalls,
   buildFunctionDependencyGraph,
-  topologicalSort,
+  topologicalSort
+} = require('../../../lib/function-extraction');
+
+const {
   extractFunctionName,
   isInitializationFunction
-} = require('../../../de.js');
+} = require('../../../lib/ast-utils');
 
 const parser = require('@babel/parser');
 
@@ -24,7 +27,8 @@ describe('依赖分析核心功能单元测试', () => {
         f2(f1);
       `;
       
-      const dependencies = collectParameterDependencies(code);
+      const mockConfig = { interceptPattern: /f\d+/ };
+      const dependencies = collectParameterDependencies(code, mockConfig);
       expect(Array.from(dependencies)).toContain('f1');
     });
 
@@ -35,7 +39,8 @@ describe('依赖分析核心功能单元测试', () => {
         f2(1, 2);
       `;
       
-      const dependencies = collectParameterDependencies(code);
+      const mockConfig = { interceptPattern: /f\d+/ };
+      const dependencies = collectParameterDependencies(code, mockConfig);
       expect(dependencies.size).toBe(0);
     });
 
@@ -47,7 +52,9 @@ describe('依赖分析核心功能单元测试', () => {
         f3(f2);
       `;
       
-      const dependencies = collectParameterDependencies(code);
+      const mockConfig = { interceptPattern: /f\d*/ };
+      const dependencies = collectParameterDependencies(code, mockConfig);
+      expect(Array.from(dependencies)).toContain('f2');
       expect(Array.from(dependencies)).toContain('f1');
     });
   });
@@ -61,7 +68,8 @@ describe('依赖分析核心功能单元测试', () => {
         })();
       `;
       
-      const calls = collectInitializationFunctionCalls(code);
+      const mockConfig = { interceptPattern: /f\d+/, verbose: false };
+      const calls = collectInitializationFunctionCalls(code, mockConfig);
       expect(calls.size).toBeGreaterThan(0);
     });
 
@@ -72,7 +80,8 @@ describe('依赖分析核心功能单元测试', () => {
         f2(f1);
       `;
       
-      const calls = collectInitializationFunctionCalls(code);
+      const mockConfig = { interceptPattern: /f\d+/, verbose: false };
+      const calls = collectInitializationFunctionCalls(code, mockConfig);
       expect(calls.has('f1')).toBe(true);
     });
 
@@ -81,10 +90,13 @@ describe('依赖分析核心功能单元测试', () => {
         function f1(a) { return a; }
         function f2(b) { return f1(b); }
         function f3(c) { return f2(c); }
-        f3(1);
+        (function() {
+          f3(1);
+        })();
       `;
       
-      const calls = collectInitializationFunctionCalls(code);
+      const mockConfig = { interceptPattern: /f\d+/, verbose: false };
+      const calls = collectInitializationFunctionCalls(code, mockConfig);
       expect(calls.has('f1')).toBe(true);
       expect(calls.has('f2')).toBe(true);
       expect(calls.has('f3')).toBe(true);
@@ -99,13 +111,15 @@ describe('依赖分析核心功能单元测试', () => {
         function f3() { f2(); f1(); }
       `;
       
-      const graph = buildFunctionDependencyGraph(code);
+      const mockConfig = { interceptPattern: /f\d+/, verbose: false };
+      const graph = buildFunctionDependencyGraph(code, mockConfig);
       
       expect(graph.has('f1')).toBe(true);
       expect(graph.has('f2')).toBe(true);
       expect(graph.has('f3')).toBe(true);
       
       expect(graph.get('f2')).toContain('f1');
+      expect(graph.get('f3')).toContain('f2');
       expect(graph.get('f3')).toContain('f2');
       expect(graph.get('f3')).toContain('f1');
     });
@@ -117,7 +131,9 @@ describe('依赖分析核心功能单元测试', () => {
         function f3() { f2(f1); }
       `;
       
-      const graph = buildFunctionDependencyGraph(code);
+      const mockConfig = { interceptPattern: /f\d+/, verbose: false };
+      const graph = buildFunctionDependencyGraph(code, mockConfig);
+      expect(graph.get('f3')).toContain('f2');
       expect(graph.get('f3')).toContain('f1');
     });
 
@@ -127,7 +143,8 @@ describe('依赖分析核心功能单元测试', () => {
         const f2 = function() { f1(); };
       `;
       
-      const graph = buildFunctionDependencyGraph(code);
+      const mockConfig = { interceptPattern: /f\d+/, verbose: false };
+      const graph = buildFunctionDependencyGraph(code, mockConfig);
       expect(graph.has('f1')).toBe(true);
       expect(graph.has('f2')).toBe(true);
       expect(graph.get('f2')).toContain('f1');
@@ -197,7 +214,7 @@ describe('依赖分析核心功能单元测试', () => {
     });
 
     test('应该忽略保留关键字', () => {
-      const ast = parser.parse('function(1, 2)');
+      const ast = parser.parse('(function(){})(1, 2)');
       const callExpression = ast.program.body[0].expression;
       
       const funcName = extractFunctionName(callExpression.callee);
