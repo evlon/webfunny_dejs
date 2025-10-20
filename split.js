@@ -157,11 +157,7 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
             
             let requirePath = decl.init.arguments[0].value;
             
-            // 修正相对路径：当模块被移动到 sub-modules 目录时，需要调整相对路径
-            if (requirePath.startsWith('./') || requirePath.startsWith('../')) {
-              requirePath = path.join('../', requirePath);
-            }
-            
+            // 不再修正相对路径，直接使用原始路径
             dependencies.set(varName, {
               type: 'require',
               code: `const ${varName} = require('${requirePath}');`,
@@ -216,25 +212,20 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
             });
             
             if (variables.length > 0) {
-              // 修正相对路径
-              if (requirePath.startsWith('./') || requirePath.startsWith('../')) {
-                requirePath = path.join('../', requirePath);
-              }
-              
-              // 为整个解构赋值生成一个依赖项
-              const depName = `destructured_${variables.join('_')}`;
-              
-              // 生成修正后的代码
-              const variableList = variables.join(', ');
-              const correctedCode = `const { ${variableList} } = require('${requirePath}');`;
-              
-              dependencies.set(depName, {
-                type: 'require_destructured',
-                code: correctedCode,
-                varName: depName,
-                requirePath: requirePath,
-                variables: variables
-              });
+            // 为整个解构赋值生成一个依赖项
+            const depName = `destructured_${variables.join('_')}`;
+            
+            // 生成代码（不修正路径）
+            const variableList = variables.join(', ');
+            const code = `const { ${variableList} } = require('${requirePath}');`;
+            
+            dependencies.set(depName, {
+              type: 'require_destructured',
+              code: code,
+              varName: depName,
+              requirePath: requirePath,
+              variables: variables
+            });
               
               // 同时为每个变量创建映射
               variables.forEach(varName => {
@@ -414,9 +405,9 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
                 const refControllerName = callee.name;
                 if (refControllerName !== className) {
                   console.log(`[INFO] 检测到控制器引用: ${className} -> ${refControllerName} (NewExpression)`);
-                  // 创建子模块间引用依赖
+                  // 创建子模块间引用依赖（使用同级目录引用）
                   const depName = `controller_ref_${className}_to_${refControllerName}`;
-                  const modulePath = `../sub-modules/${refControllerName.toLowerCase()}`;
+                  const modulePath = `./${refControllerName.toLowerCase()}`;
                   
                   dependencies.set(depName, {
                     type: 'controller_reference',
@@ -449,9 +440,9 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
                 const refControllerName = property.name;
                 if (refControllerName !== className) {
                   console.log(`[INFO] 检测到控制器属性引用: ${className} -> ${refControllerName} (MemberExpression)`);
-                  // 创建子模块间引用依赖
+                  // 创建子模块间引用依赖（使用同级目录引用）
                   const depName = `controller_property_ref_${className}_to_${refControllerName}`;
-                  const modulePath = `../sub-modules/${refControllerName.toLowerCase()}`;
+                  const modulePath = `./${refControllerName.toLowerCase()}`;
                   
                   dependencies.set(depName, {
                     type: 'controller_property_reference',
@@ -479,9 +470,9 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
                 const refControllerName = object.name;
                 if (refControllerName !== className) {
                   console.log(`[INFO] 检测到静态方法引用: ${className} -> ${refControllerName} (MemberExpression)`);
-                  // 创建子模块间引用依赖
+                  // 创建子模块间引用依赖（使用同级目录引用）
                   const depName = `controller_static_ref_${className}_to_${refControllerName}`;
-                  const modulePath = `../sub-modules/${refControllerName.toLowerCase()}`;
+                  const modulePath = `./${refControllerName.toLowerCase()}`;
                   
                   dependencies.set(depName, {
                     type: 'controller_static_reference',
@@ -733,189 +724,33 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
     traceDependencies(depName);
   });
   
-  // 构建完整的依赖关系图并进行拓扑排序
-  const dependencyGraph = new Map();
-  const allNodes = new Set();
+  // 完全按照原文件顺序：变量、函数、require等保持原样
+  const sortedDependencies = [];
   
-  // 将所有使用的依赖项添加到图中
-  usedDependencies.forEach(depName => {
-    if (!dependencyGraph.has(depName)) {
-      dependencyGraph.set(depName, new Set());
-    }
-    allNodes.add(depName);
-  });
+  // 按原文件中的声明顺序收集所有语句
+  const ast = parseCode(originalCode);
   
-  // 构建完整的依赖关系
-  usedDependencies.forEach(depName => {
-    if (!globalDependencies.has(depName)) return;
-    
-    const dep = globalDependencies.get(depName);
-    
-    // 处理不同类型的依赖关系
-    switch (dep.type) {
-      case 'indirect_destructured':
-        // indirect_destructured 依赖于 sourceVar
-        if (globalDependencies.has(dep.sourceVar)) {
-          dependencyGraph.get(depName).add(dep.sourceVar);
-          allNodes.add(dep.sourceVar);
-        }
-        break;
-        
-      case 'variable_from_indirect_destructured':
-        // variable_from_indirect_destructured 依赖于 sourceDep
-        if (globalDependencies.has(dep.sourceDep)) {
-          dependencyGraph.get(depName).add(dep.sourceDep);
-          allNodes.add(dep.sourceDep);
-        }
-        break;
-        
-      case 'variable_from_destructured':
-        // variable_from_destructured 依赖于 sourceDep
-        if (globalDependencies.has(dep.sourceDep)) {
-          dependencyGraph.get(depName).add(dep.sourceDep);
-          allNodes.add(dep.sourceDep);
-        }
-        break;
-        
-      case 'require':
-        // require 语句通常没有依赖，但需要确保在所有全局声明之后
-        break;
-        
-      case 'require_destructured':
-        // 解构的 require 没有依赖
-        break;
-        
-      case 'controller_reference':
-      case 'controller_property_reference':
-      case 'controller_static_reference':
-        // 控制器引用：确保在被引用的控制器之后声明
-        if (allControllers && allControllers.has(dep.sourceController) && dep.sourceController !== name) {
-          // 被引用的控制器应该先被声明
-          console.log(`[DEBUG] 控制器 ${name} 依赖于 ${dep.sourceController}`);
-        }
-        break;
-    }
-  });
-  
-  // 完善依赖关系：分析变量之间的使用关系
-  usedDependencies.forEach(depName => {
-    if (!globalDependencies.has(depName)) return;
-    
-    const dep = globalDependencies.get(depName);
-    
-    // 分析依赖代码中的变量引用
-    if (dep.code) {
-      const codeAst = parseCode(dep.code);
-      traverse(codeAst, {
-        Identifier(path) {
-          const refName = path.node.name;
-          
-          // 如果引用了其他依赖项，建立依赖关系
-          if (usedDependencies.has(refName) && refName !== depName) {
-            if (!dependencyGraph.has(depName)) {
-              dependencyGraph.set(depName, new Set());
-            }
-            dependencyGraph.get(depName).add(refName);
-            allNodes.add(refName);
+  ast.program.body.forEach(node => {
+    if (node.type === 'VariableDeclaration') {
+      // 变量声明
+      node.declarations.forEach(decl => {
+        if (decl.id.type === 'Identifier') {
+          const varName = decl.id.name;
+          if (usedDependencies.has(varName)) {
+            sortedDependencies.push(varName);
           }
         }
       });
-    }
-    
-    // 特殊处理：确保 require 语句在其他全局声明之前
-    if (dep.type === 'require' || dep.type === 'require_destructured') {
-      // require 语句应该在其他全局声明之前
-      globalDeclarations.forEach((decl, declName) => {
-        if (usedDependencies.has(declName) && declName !== depName) {
-          if (!dependencyGraph.has(declName)) {
-            dependencyGraph.set(declName, new Set());
-          }
-          // 全局声明依赖于 require 语句
-          dependencyGraph.get(declName).add(depName);
-        }
-      });
+    } else if (node.type === 'FunctionDeclaration' && node.id) {
+      // 函数声明
+      const funcName = node.id.name;
+      if (usedDependencies.has(funcName)) {
+        sortedDependencies.push(funcName);
+      }
     }
   });
   
-  // 新增：处理全局声明之间的依赖关系
-  globalDeclarations.forEach((decl, declName) => {
-    if (usedDependencies.has(declName) && decl.dependencies) {
-      // 为全局声明建立依赖关系
-      if (!dependencyGraph.has(declName)) {
-        dependencyGraph.set(declName, new Set());
-      }
-      
-      // 添加该声明的所有依赖项
-      decl.dependencies.forEach(depVarName => {
-        // 只添加在原始文件中实际存在的变量依赖
-        if (globalDeclarations.has(depVarName) && usedDependencies.has(depVarName) && depVarName !== declName) {
-          dependencyGraph.get(declName).add(depVarName);
-          allNodes.add(depVarName);
-          console.log(`[DEBUG] 全局声明 ${declName} 依赖于 ${depVarName}`);
-        }
-      });
-    }
-  });
-  
-  // 增强的拓扑排序函数，正确处理循环依赖
-  const topologicalSort = (graph) => {
-    const visited = new Set();
-    const visiting = new Set(); // 用于检测循环依赖
-    const result = [];
-    
-    const visit = (node) => {
-      if (visited.has(node)) return;
-      
-      // 检测循环依赖
-      if (visiting.has(node)) {
-        console.warn(`[WARN] 检测到循环依赖: ${node}`);
-        return;
-      }
-      
-      visiting.add(node);
-      
-      // 先访问所有依赖项
-      if (graph.has(node)) {
-        for (const dependency of graph.get(node)) {
-          visit(dependency);
-        }
-      }
-      
-      visiting.delete(node);
-      visited.add(node);
-      
-      // 确保节点只被添加一次
-      if (!result.includes(node)) {
-        result.push(node);
-      }
-    };
-    
-    // 处理所有节点
-    Array.from(allNodes).forEach(node => {
-      if (!visited.has(node)) {
-        visit(node);
-      }
-    });
-    
-    // 添加未在依赖图中的独立节点
-    allNodes.forEach(node => {
-      if (!result.includes(node)) {
-        result.push(node);
-      }
-    });
-    
-    return result;
-  };
-  
-  // 获取排序后的依赖项
-  const sortedDependencies = topologicalSort(dependencyGraph);
-  
-  // 添加未在依赖图中的直接依赖
-  usedDependencies.forEach(depName => {
-    if (!sortedDependencies.includes(depName) && globalDependencies.has(depName)) {
-      sortedDependencies.push(depName);
-    }
-  });
+  console.log(`[DEBUG] 按原文件顺序排列的依赖项: ${sortedDependencies.join(', ')}`);
   
   // 第一步：添加全局变量声明（在依赖之前）
   const usedGlobalDeclarations = new Set();
@@ -1065,14 +900,14 @@ function generateMainEntryFile(splitModules, originalFile) {
  * 控制器脚本拆分后的主入口文件
  * 原始文件: ${path.basename(originalFile)}
  * 拆分时间: ${new Date().toISOString()}
- * 控制器模块目录: sub-modules/
+ * 控制器模块: 同目录下的控制器文件
  */
 
 `;
   
-  // 添加所有控制器模块的require
+  // 添加所有控制器模块的require（引用同级目录下的文件）
   splitModules.forEach((moduleInfo, className) => {
-    const modulePath = `./sub-modules/${moduleInfo.fileName.replace('.js', '')}`;
+    const modulePath = `./${moduleInfo.fileName.replace('.js', '')}`;
     content += `const ${moduleInfo.moduleName} = require('${modulePath}');\n`;
   });
   
@@ -1128,15 +963,15 @@ function splitControllerScript(targetFile, outputDir, options = {}) {
       throw new Error('未找到任何控制器类定义');
     }
     
-    // 子模块目录路径
-    const subModulesDir = path.join(outputDir, 'sub-modules');
+    // 子模块直接保存在输出目录（与原文件相同目录）
+    const modulesDir = outputDir;
     
     // 确保目录存在
-    if (!fs.existsSync(subModulesDir)) {
-      fs.mkdirSync(subModulesDir, { recursive: true });
+    if (!fs.existsSync(modulesDir)) {
+      fs.mkdirSync(modulesDir, { recursive: true });
     }
     
-    console.log(`准备拆分 ${controllers.size} 个控制器到 sub-modules 目录`);
+    console.log(`准备拆分 ${controllers.size} 个控制器到 ${modulesDir} 目录`);
     
     // 生成控制器模块
     const splitModules = new Map();
@@ -1155,11 +990,11 @@ function splitControllerScript(targetFile, outputDir, options = {}) {
       });
     });
     
-    // 写入控制器模块文件
+    // 写入控制器模块文件（直接保存在输出目录）
     splitModules.forEach((moduleInfo, className) => {
-      const filePath = path.join(subModulesDir, moduleInfo.fileName);
+      const filePath = path.join(modulesDir, moduleInfo.fileName);
       fs.writeFileSync(filePath, moduleInfo.content, 'utf8');
-      console.log(`生成控制器模块: sub-modules/${moduleInfo.fileName} (${className})`);
+      console.log(`生成控制器模块: ${moduleInfo.fileName} (${className})`);
     });
     
     // 生成主入口文件
@@ -1169,8 +1004,9 @@ function splitControllerScript(targetFile, outputDir, options = {}) {
     console.log(`生成主入口文件: ${path.basename(targetFile)}`);
     
     console.log(`\n✅ 控制器拆分完成！`);
-    console.log(`- 拆分了 ${splitModules.size} 个控制器到 sub-modules 目录`);
+    console.log(`- 拆分了 ${splitModules.size} 个控制器到 ${modulesDir} 目录`);
     console.log(`- 主入口文件: ${path.basename(targetFile)}（保持原文件名）`);
+    console.log(`- 控制器模块: ${Array.from(splitModules.keys()).map(name => `${name.toLowerCase()}.js`).join(', ')}`);
     console.log(`- 原有引用可以继续使用 require('./${path.basename(targetFile)}')`);
     
     return {
@@ -1182,7 +1018,7 @@ function splitControllerScript(targetFile, outputDir, options = {}) {
         isExported: info.isExported
       })),
       mainEntryFile: mainEntryPath,
-      subModulesDir: subModulesDir
+      modulesDir: modulesDir
     };
     
   } catch (error) {
