@@ -168,13 +168,35 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
               varName: varName,
               requirePath: requirePath
             });
-          } else {
-            // 记录其他类型的变量赋值
-            variableAssignments.set(varName, {
-              node: decl,
-              init: decl.init
-            });
-          }
+        } else if (decl.init) {
+          // 记录其他类型的变量赋值，并分析赋值依赖
+          variableAssignments.set(varName, {
+            node: decl,
+            init: decl.init
+          });
+          
+          // 分析赋值表达式中可能存在的依赖关系
+          const assignmentAst = parseCode(generate(decl).code);
+          traverse(assignmentAst, {
+            Identifier(path) {
+              const refName = path.node.name;
+              
+              // 如果引用了其他变量，建立依赖关系
+              if (refName !== varName) {
+                if (!dependencies.has(varName)) {
+                  dependencies.set(varName, {
+                    type: 'variable_assignment',
+                    code: generate(decl).code,
+                    varName: varName,
+                    dependencies: new Set()
+                  });
+                }
+                
+                dependencies.get(varName).dependencies.add(refName);
+              }
+            }
+          });
+        }
         } else if (decl.id.type === 'ObjectPattern') {
           // 处理解构赋值
           if (decl.init && decl.init.type === 'CallExpression' && 
@@ -262,7 +284,7 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
     }
   });
   
-  // 第二遍：收集全局声明（变量、函数等）
+    // 第二遍：收集全局声明（变量、函数等），并分析声明之间的依赖关系
   ast.program.body.forEach(node => {
     // 收集变量声明
     if (node.type === 'VariableDeclaration') {
@@ -284,16 +306,40 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
             }
           }
           
+          // 分析变量声明中的依赖关系
+          const declarationDependencies = new Set();
+          if (decl.init) {
+            try {
+              // 分析初始化表达式中的依赖
+              const initCode = generate(decl.init).code;
+              if (initCode) {
+                const initAst = parseCode(initCode);
+                traverse(initAst, {
+                  Identifier(path) {
+                    const refName = path.node.name;
+                    if (refName !== varName && refName !== 'undefined' && refName !== 'null') {
+                      declarationDependencies.add(refName);
+                      console.log(`[DEBUG] 变量 ${varName} 依赖于 ${refName}`);
+                    }
+                  }
+                });
+              }
+            } catch (error) {
+              console.warn(`[WARN] 分析变量 ${varName} 的依赖关系失败: ${error.message}`);
+            }
+          }
+          
           // 收集全局变量声明
           const declarationCode = generate(node).code;
           globalDeclarations.set(varName, {
             type: 'variable_declaration',
             code: declarationCode,
             varName: varName,
-            node: node
+            node: node,
+            dependencies: declarationDependencies
           });
           
-          console.log(`[DEBUG] 收集全局变量声明: ${varName}`);
+          console.log(`[DEBUG] 收集全局变量声明: ${varName}, 依赖: ${Array.from(declarationDependencies)}`);
         }
       });
     }
@@ -316,15 +362,38 @@ function extractGlobalDependencies(originalCode, targetFile, allControllers) {
           }
         }
         
+        // 分析函数体中的依赖关系
+        const functionDependencies = new Set();
+        if (node.body) {
+          try {
+            traverse(node.body, {
+              Identifier(path) {
+                const refName = path.node.name;
+                // 跳过函数参数和内部变量声明
+                if (path.scope.hasBinding(refName) || refName === funcName) {
+                  return;
+                }
+                if (refName !== 'undefined' && refName !== 'null') {
+                  functionDependencies.add(refName);
+                  console.log(`[DEBUG] 函数 ${funcName} 依赖于 ${refName}`);
+                }
+              }
+            });
+          } catch (error) {
+            console.warn(`[WARN] 分析函数 ${funcName} 的依赖关系失败: ${error.message}`);
+          }
+        }
+        
         const declarationCode = generate(node).code;
         globalDeclarations.set(funcName, {
           type: 'function_declaration',
           code: declarationCode,
           varName: funcName,
-          node: node
+          node: node,
+          dependencies: functionDependencies
         });
         
-        console.log(`[DEBUG] 收集全局函数声明: ${funcName}`);
+        console.log(`[DEBUG] 收集全局函数声明: ${funcName}, 依赖: ${Array.from(functionDependencies)}`);
       }
     }
   });
@@ -549,88 +618,291 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
     }
   });
   
-  // 递归追踪间接依赖
-  const traceDependencies = (depName) => {
-    if (globalDependencies.has(depName)) {
-      const dep = globalDependencies.get(depName);
-      
-      if (dep.type === 'variable_from_assignment' && !usedDependencies.has(dep.sourceVar)) {
-        usedDependencies.add(dep.sourceVar);
-        traceDependencies(dep.sourceVar);
-      } else if (dep.type === 'indirect_destructured' && !usedDependencies.has(dep.sourceVar)) {
-        usedDependencies.add(dep.sourceVar);
-        traceDependencies(dep.sourceVar);
-      } else if (dep.type === 'variable_from_indirect_destructured' && !usedDependencies.has(dep.sourceDep)) {
-        usedDependencies.add(dep.sourceDep);
-        traceDependencies(dep.sourceDep);
-      } else if ((dep.type === 'controller_reference' || 
-                  dep.type === 'controller_property_reference' ||
-                  dep.type === 'controller_static_reference') &&
-                 !usedDependencies.has(dep.varName)) {
-        usedDependencies.add(dep.varName);
-      }
-    }
-  };
-  
-  // 初次收集后，进行深度追踪
-  const initialDeps = Array.from(usedDependencies);
-  initialDeps.forEach(depName => {
-    traceDependencies(depName);
-  });
-  
-  // 构建依赖关系图并进行拓扑排序
-  const dependencyGraph = new Map();
-  const visited = new Set();
-  
-  // 构建依赖关系
-  const buildDependencyGraph = (depName) => {
+  // 增强的依赖追踪函数
+  const traceDependencies = (depName, visited = new Set()) => {
     if (visited.has(depName) || !globalDependencies.has(depName)) return;
     
     visited.add(depName);
     const dep = globalDependencies.get(depName);
     
-    if (!dependencyGraph.has(depName)) {
-      dependencyGraph.set(depName, new Set());
+    // 根据依赖类型追踪间接依赖
+    switch (dep.type) {
+      case 'variable_from_assignment':
+        if (!usedDependencies.has(dep.sourceVar)) {
+          usedDependencies.add(dep.sourceVar);
+          traceDependencies(dep.sourceVar, visited);
+        }
+        break;
+        
+      case 'indirect_destructured':
+        if (!usedDependencies.has(dep.sourceVar)) {
+          usedDependencies.add(dep.sourceVar);
+          traceDependencies(dep.sourceVar, visited);
+        }
+        break;
+        
+      case 'variable_from_indirect_destructured':
+        if (!usedDependencies.has(dep.sourceDep)) {
+          usedDependencies.add(dep.sourceDep);
+          traceDependencies(dep.sourceDep, visited);
+        }
+        break;
+        
+      case 'variable_from_destructured':
+        if (!usedDependencies.has(dep.sourceDep)) {
+          usedDependencies.add(dep.sourceDep);
+          traceDependencies(dep.sourceDep, visited);
+        }
+        break;
+        
+      case 'controller_reference':
+      case 'controller_property_reference':
+      case 'controller_static_reference':
+        if (!usedDependencies.has(dep.varName)) {
+          usedDependencies.add(dep.varName);
+        }
+        break;
+        
+      case 'variable_declaration':
+      case 'function_declaration':
+        // 对于全局声明，追踪其依赖的所有变量
+        if (dep.dependencies) {
+          dep.dependencies.forEach(refName => {
+            // 只追踪在原始文件中实际存在的变量
+            if (globalDeclarations.has(refName) && !usedDependencies.has(refName)) {
+              usedDependencies.add(refName);
+              traceDependencies(refName, visited);
+            }
+          });
+        }
+        break;
     }
     
-    // 添加依赖关系
-    if (dep.type === 'indirect_destructured' && globalDependencies.has(dep.sourceVar)) {
-      dependencyGraph.get(depName).add(dep.sourceVar);
-      buildDependencyGraph(dep.sourceVar);
-    } else if (dep.type === 'variable_from_indirect_destructured' && globalDependencies.has(dep.sourceDep)) {
-      dependencyGraph.get(depName).add(dep.sourceDep);
-      buildDependencyGraph(dep.sourceDep);
-    } else if (dep.type === 'controller_reference' || dep.type === 'controller_property_reference') {
-      // 控制器引用不添加依赖关系，避免循环依赖
-      console.log(`[INFO] 控制器 ${name} 引用了控制器 ${dep.sourceController}`);
+    // 递归追踪依赖代码中引用的其他变量
+    if (dep.code) {
+      const codeAst = parseCode(dep.code);
+      traverse(codeAst, {
+        Identifier(path) {
+          const refName = path.node.name;
+          if (refName !== depName && globalDependencies.has(refName) && !usedDependencies.has(refName)) {
+            usedDependencies.add(refName);
+            traceDependencies(refName, visited);
+          }
+        }
+      });
+    }
+    
+    // 新增：追踪全局声明之间的依赖关系
+    if (globalDeclarations.has(depName)) {
+      const decl = globalDeclarations.get(depName);
+      if (decl.dependencies) {
+        decl.dependencies.forEach(refName => {
+          if (!usedDependencies.has(refName)) {
+            usedDependencies.add(refName);
+            traceDependencies(refName, visited);
+          }
+        });
+      }
+    }
+    
+    // 增强：追踪全局声明节点中的依赖关系
+    if (dep.node && dep.node.init) {
+      try {
+        const nodeCode = generate(dep.node).code;
+        if (nodeCode) {
+          const nodeAst = parseCode(nodeCode);
+          traverse(nodeAst, {
+            Identifier(path) {
+              const refName = path.node.name;
+              if (refName !== depName && globalDependencies.has(refName) && !usedDependencies.has(refName)) {
+                usedDependencies.add(refName);
+                traceDependencies(refName, visited);
+              }
+            }
+          });
+        }
+      } catch (error) {
+        console.warn(`[WARN] 追踪节点 ${depName} 的依赖关系失败: ${error.message}`);
+      }
     }
   };
   
-  // 为所有使用的依赖项构建依赖图
-  usedDependencies.forEach(depName => buildDependencyGraph(depName));
+  // 进行深度依赖追踪
+  const initialDeps = Array.from(usedDependencies);
+  initialDeps.forEach(depName => {
+    traceDependencies(depName);
+  });
   
-  // 拓扑排序函数
+  // 构建完整的依赖关系图并进行拓扑排序
+  const dependencyGraph = new Map();
+  const allNodes = new Set();
+  
+  // 将所有使用的依赖项添加到图中
+  usedDependencies.forEach(depName => {
+    if (!dependencyGraph.has(depName)) {
+      dependencyGraph.set(depName, new Set());
+    }
+    allNodes.add(depName);
+  });
+  
+  // 构建完整的依赖关系
+  usedDependencies.forEach(depName => {
+    if (!globalDependencies.has(depName)) return;
+    
+    const dep = globalDependencies.get(depName);
+    
+    // 处理不同类型的依赖关系
+    switch (dep.type) {
+      case 'indirect_destructured':
+        // indirect_destructured 依赖于 sourceVar
+        if (globalDependencies.has(dep.sourceVar)) {
+          dependencyGraph.get(depName).add(dep.sourceVar);
+          allNodes.add(dep.sourceVar);
+        }
+        break;
+        
+      case 'variable_from_indirect_destructured':
+        // variable_from_indirect_destructured 依赖于 sourceDep
+        if (globalDependencies.has(dep.sourceDep)) {
+          dependencyGraph.get(depName).add(dep.sourceDep);
+          allNodes.add(dep.sourceDep);
+        }
+        break;
+        
+      case 'variable_from_destructured':
+        // variable_from_destructured 依赖于 sourceDep
+        if (globalDependencies.has(dep.sourceDep)) {
+          dependencyGraph.get(depName).add(dep.sourceDep);
+          allNodes.add(dep.sourceDep);
+        }
+        break;
+        
+      case 'require':
+        // require 语句通常没有依赖，但需要确保在所有全局声明之后
+        break;
+        
+      case 'require_destructured':
+        // 解构的 require 没有依赖
+        break;
+        
+      case 'controller_reference':
+      case 'controller_property_reference':
+      case 'controller_static_reference':
+        // 控制器引用：确保在被引用的控制器之后声明
+        if (allControllers && allControllers.has(dep.sourceController) && dep.sourceController !== name) {
+          // 被引用的控制器应该先被声明
+          console.log(`[DEBUG] 控制器 ${name} 依赖于 ${dep.sourceController}`);
+        }
+        break;
+    }
+  });
+  
+  // 完善依赖关系：分析变量之间的使用关系
+  usedDependencies.forEach(depName => {
+    if (!globalDependencies.has(depName)) return;
+    
+    const dep = globalDependencies.get(depName);
+    
+    // 分析依赖代码中的变量引用
+    if (dep.code) {
+      const codeAst = parseCode(dep.code);
+      traverse(codeAst, {
+        Identifier(path) {
+          const refName = path.node.name;
+          
+          // 如果引用了其他依赖项，建立依赖关系
+          if (usedDependencies.has(refName) && refName !== depName) {
+            if (!dependencyGraph.has(depName)) {
+              dependencyGraph.set(depName, new Set());
+            }
+            dependencyGraph.get(depName).add(refName);
+            allNodes.add(refName);
+          }
+        }
+      });
+    }
+    
+    // 特殊处理：确保 require 语句在其他全局声明之前
+    if (dep.type === 'require' || dep.type === 'require_destructured') {
+      // require 语句应该在其他全局声明之前
+      globalDeclarations.forEach((decl, declName) => {
+        if (usedDependencies.has(declName) && declName !== depName) {
+          if (!dependencyGraph.has(declName)) {
+            dependencyGraph.set(declName, new Set());
+          }
+          // 全局声明依赖于 require 语句
+          dependencyGraph.get(declName).add(depName);
+        }
+      });
+    }
+  });
+  
+  // 新增：处理全局声明之间的依赖关系
+  globalDeclarations.forEach((decl, declName) => {
+    if (usedDependencies.has(declName) && decl.dependencies) {
+      // 为全局声明建立依赖关系
+      if (!dependencyGraph.has(declName)) {
+        dependencyGraph.set(declName, new Set());
+      }
+      
+      // 添加该声明的所有依赖项
+      decl.dependencies.forEach(depVarName => {
+        // 只添加在原始文件中实际存在的变量依赖
+        if (globalDeclarations.has(depVarName) && usedDependencies.has(depVarName) && depVarName !== declName) {
+          dependencyGraph.get(declName).add(depVarName);
+          allNodes.add(depVarName);
+          console.log(`[DEBUG] 全局声明 ${declName} 依赖于 ${depVarName}`);
+        }
+      });
+    }
+  });
+  
+  // 增强的拓扑排序函数，正确处理循环依赖
   const topologicalSort = (graph) => {
     const visited = new Set();
+    const visiting = new Set(); // 用于检测循环依赖
     const result = [];
     
     const visit = (node) => {
       if (visited.has(node)) return;
-      visited.add(node);
       
+      // 检测循环依赖
+      if (visiting.has(node)) {
+        console.warn(`[WARN] 检测到循环依赖: ${node}`);
+        return;
+      }
+      
+      visiting.add(node);
+      
+      // 先访问所有依赖项
       if (graph.has(node)) {
         for (const dependency of graph.get(node)) {
           visit(dependency);
         }
       }
       
-      result.push(node);
+      visiting.delete(node);
+      visited.add(node);
+      
+      // 确保节点只被添加一次
+      if (!result.includes(node)) {
+        result.push(node);
+      }
     };
     
-    // 从所有节点开始遍历
-    for (const node of graph.keys()) {
-      visit(node);
-    }
+    // 处理所有节点
+    Array.from(allNodes).forEach(node => {
+      if (!visited.has(node)) {
+        visit(node);
+      }
+    });
+    
+    // 添加未在依赖图中的独立节点
+    allNodes.forEach(node => {
+      if (!result.includes(node)) {
+        result.push(node);
+      }
+    });
     
     return result;
   };
@@ -700,8 +972,10 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
     content += '\n';
   }
   
-  // 第二步：按照排序后的顺序添加依赖声明
+  // 第二步：按照正确的依赖顺序添加依赖声明
   const addedDeps = new Set();
+  
+  // 先添加 require 语句（这些应该在最前面）
   sortedDependencies.forEach(depName => {
     if (globalDependencies.has(depName) && !addedDeps.has(depName)) {
       const dep = globalDependencies.get(depName);
@@ -715,17 +989,52 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
         return;
       }
       
-      // 对于require类型的依赖，添加相应的代码
-      if (dep.type === 'require_destructured' || dep.type === 'require' || 
-          dep.type === 'indirect_destructured' || 
+      // 第一步：添加所有 require 语句
+      if (dep.type === 'require' || dep.type === 'require_destructured') {
+        console.log(`[DEBUG] 添加 require 依赖: ${depName} (类型: ${dep.type})`);
+        content += `${dep.code}\n`;
+        addedDeps.add(depName);
+      }
+    }
+  });
+  
+  // 添加分隔符
+  if (addedDeps.size > 0) {
+    content += '\n';
+  }
+  
+  // 第二步：添加全局声明代码
+  sortedDependencies.forEach(depName => {
+    if (globalDeclarations.has(depName) && !addedDeps.has(depName)) {
+      const decl = globalDeclarations.get(depName);
+      console.log(`[DEBUG] 添加全局声明: ${depName} (类型: ${decl.type})`);
+      content += `${decl.code}\n`;
+      addedDeps.add(depName);
+    }
+  });
+  
+  // 第三步：添加其他类型的依赖声明
+  sortedDependencies.forEach(depName => {
+    if (globalDependencies.has(depName) && !addedDeps.has(depName)) {
+      const dep = globalDependencies.get(depName);
+      
+      // 过滤自引用依赖
+      if ((dep.type === 'controller_reference' || 
+           dep.type === 'controller_property_reference' ||
+           dep.type === 'controller_static_reference') && 
+          dep.sourceController === name) {
+        return;
+      }
+      
+      // 添加非 require 类型的依赖
+      if (dep.type === 'indirect_destructured' || 
           dep.type === 'controller_reference' || 
           dep.type === 'controller_property_reference' ||
           dep.type === 'controller_static_reference') {
-        console.log(`[DEBUG] 添加依赖代码: ${depName} (类型: ${dep.type})`);
+        console.log(`[DEBUG] 添加其他依赖: ${depName} (类型: ${dep.type})`);
         content += `${dep.code}\n`;
+        addedDeps.add(depName);
       }
-      
-      addedDeps.add(depName);
     }
   });
   

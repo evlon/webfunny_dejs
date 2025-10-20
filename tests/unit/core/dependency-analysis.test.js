@@ -16,7 +16,7 @@ describe('依赖分析功能测试', () => {
         const config = require('./config');
       `;
       
-      const dependencies = extractGlobalDependencies(code, '/test/file.js');
+      const {dependencies} = extractGlobalDependencies(code, '/test/file.js');
       
       expect(dependencies.size).toBe(3);
       expect(dependencies.has('fs')).toBe(true);
@@ -35,7 +35,7 @@ describe('依赖分析功能测试', () => {
         const sso = require('../../../sso');
       `;
       
-      const dependencies = extractGlobalDependencies(code, '/test/file.js');
+        const {dependencies} = extractGlobalDependencies(code, '/test/file.js');
       
       const configDep = dependencies.get('config');
       expect(configDep.requirePath).toBe('../config');
@@ -53,7 +53,7 @@ describe('依赖分析功能测试', () => {
         const { Component, useState } = require('react');
       `;
       
-      const dependencies = extractGlobalDependencies(code, '/test/file.js');
+       const {dependencies} = extractGlobalDependencies(code, '/test/file.js');
       
       // 应该为解构赋值创建特殊的依赖项
       expect(dependencies.has('readFile')).toBe(true);
@@ -78,7 +78,7 @@ describe('依赖分析功能测试', () => {
         const { host, port } = database;
       `;
       
-      const dependencies = extractGlobalDependencies(code, '/test/file.js');
+       const {dependencies} = extractGlobalDependencies(code, '/test/file.js');
       
       // 应该检测到间接解构赋值
       expect(dependencies.has('database')).toBe(true);
