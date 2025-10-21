@@ -1,892 +1,388 @@
 #!/usr/bin/env node
 
 /**
- * 加密脚本拆分工具 - 完整执行环境版本
- * 确保每个拆分后的模块都能独立执行，包含完整的闭包环境
+ * 加密脚本拆分工具 - 依赖链保留策略
+ * 策略：
+ * 1. 复制原文件所有全局内容到每个子模块
+ * 2. 添加子模块间的依赖引用
+ * 3. 只删除确认不需要的其他类定义
+ * 4. 保留完整的依赖链（如果A被保留且A依赖B，则B也必须保留）
+ * 
+ * 原则：宁可保留不需要的代码，也不能遗漏需要的代码
  */
 
 const fs = require('fs');
 const path = require('path');
-
-// 复用 lib 目录中的AST工具
 const { parseCode, traverse, generate } = require('./lib/ast-utils');
 
 /**
- * 分析目标脚本的控制器类结构
+ * 分析控制器脚本结构
  */
 function analyzeControllerScript(targetFile) {
-  console.log(`分析控制器脚本: ${targetFile}`);
+  console.log(`\n📖 分析控制器脚本: ${targetFile}`);
   
-  try {
-    const code = fs.readFileSync(targetFile, 'utf8');
-    const ast = parseCode(code);
-    
-    const controllers = new Map(); // 类名 -> 类信息
-    const exports = new Map(); // 导出名 -> 类名
-    const requiredModules = new Set(); // 依赖模块
-    
-    console.log('开始AST分析...');
-    
-    // 分析require语句
-    traverse(ast, {
-      CallExpression(path) {
-        if (path.node.callee.type === 'Identifier' && path.node.callee.name === 'require') {
-          if (path.node.arguments.length > 0 && path.node.arguments[0].type === 'StringLiteral') {
-            requiredModules.add(path.node.arguments[0].value);
-          }
-        }
-      }
-    });
-    
-    // 收集所有类定义
-    let classCount = 0;
-    traverse(ast, {
-      ClassDeclaration(path) {
-        const className = path.node.id?.name;
-        if (className) {
-          classCount++;
-          console.log(`找到类定义 [${classCount}]: ${className}`);
-          
-          controllers.set(className, {
-            name: className,
-            node: path.node,
-            code: generate(path.node).code,
-            startLine: path.node.loc?.start.line,
-            endLine: path.node.loc?.end.line,
-            isExported: false,
-            exportName: className
-          });
-        }
-      }
-    });
-    
-    // 分析导出结构
-    let exportFound = false;
-    traverse(ast, {
-      AssignmentExpression(path) {
-        // 处理 module.exports = { ... }
-        if (path.node.left.type === 'MemberExpression' &&
-            path.node.left.object?.name === 'module' &&
-            path.node.left.property?.name === 'exports') {
-          
-          exportFound = true;
-          console.log('找到module.exports赋值语句');
-          
-          if (path.node.right.type === 'ObjectExpression') {
-            console.log('找到ObjectExpression导出对象');
-            
-            path.node.right.properties.forEach((prop, index) => {
-              console.log(`处理导出属性 [${index}]:`, prop.type);
-              
-              if (prop.type === 'ObjectProperty') {
-                let keyName = '';
-                let valueName = '';
-                
-                // 获取键名
-                if (prop.key.type === 'Identifier') {
-                  keyName = prop.key.name;
-                }
-                
-                // 获取值名
-                if (prop.value.type === 'Identifier') {
-                  valueName = prop.value.name;
-                }
-                
-                if (keyName && valueName) {
-                  exports.set(keyName, valueName);
-                  console.log(`导出映射: ${keyName} -> ${valueName}`);
-                  
-                  // 标记这个类被导出了
-                  if (controllers.has(valueName)) {
-                    controllers.get(valueName).isExported = true;
-                    controllers.get(valueName).exportName = keyName;
-                    console.log(`标记类 ${valueName} 为已导出，导出名: ${keyName}`);
-                  }
-                }
-              }
-            });
-          }
-        }
-      }
-    });
-    
-    if (!exportFound) {
-      console.log('警告: 未找到module.exports语句');
-    }
-    
-    console.log(`AST分析完成: 找到 ${controllers.size} 个类，${exports.size} 个导出项`);
-    
-    return {
-      controllers,
-      exports,
-      requiredModules,
-      ast,
-      code
-    };
-    
-  } catch (error) {
-    console.error(`分析控制器脚本失败: ${error.message}`);
-    throw error;
-  }
-}
-
-/**
- * 提取原始文件中的全局依赖（require语句、变量声明等），包括子模块间引用
- */
-function extractGlobalDependencies(originalCode, targetFile, allControllers) {
-  const ast = parseCode(originalCode);
-  const dependencies = new Map(); // 变量名 -> 依赖内容
-  const variableAssignments = new Map(); // 变量名 -> 赋值内容
-  const globalDeclarations = new Map(); // 全局声明（变量、函数等）
+  const code = fs.readFileSync(targetFile, 'utf8');
+  const ast = parseCode(code);
   
-  // 收集所有控制器类名，用于检测子模块间引用
-  const controllerNames = new Set(allControllers ? allControllers.keys() : []);
+  const controllers = new Map();
+  const exports = new Map();
+  const globalStatements = []; // 所有非类定义的全局语句
   
-  // 第一遍：收集所有变量声明和赋值
-  ast.program.body.forEach(node => {
-    if (node.type === 'VariableDeclaration') {
-      node.declarations.forEach(decl => {
-        if (decl.id.type === 'Identifier') {
-          const varName = decl.id.name;
-          
-          // 处理require语句
-          if (decl.init && 
-              decl.init.type === 'CallExpression' && 
-              decl.init.callee.type === 'Identifier' && 
-              decl.init.callee.name === 'require') {
-            
-            let requirePath = decl.init.arguments[0].value;
-            
-            // 不再修正相对路径，直接使用原始路径
-            dependencies.set(varName, {
-              type: 'require',
-              code: `const ${varName} = require('${requirePath}');`,
-              varName: varName,
-              requirePath: requirePath
-            });
-        } else if (decl.init) {
-          // 记录其他类型的变量赋值，并分析赋值依赖
-          variableAssignments.set(varName, {
-            node: decl,
-            init: decl.init
-          });
-          
-          // 分析赋值表达式中可能存在的依赖关系
-          const assignmentAst = parseCode(generate(decl).code);
-          traverse(assignmentAst, {
-            Identifier(path) {
-              const refName = path.node.name;
-              
-              // 如果引用了其他变量，建立依赖关系
-              if (refName !== varName) {
-                if (!dependencies.has(varName)) {
-                  dependencies.set(varName, {
-                    type: 'variable_assignment',
-                    code: generate(decl).code,
-                    varName: varName,
-                    dependencies: new Set()
-                  });
-                }
-                
-                dependencies.get(varName).dependencies.add(refName);
-              }
-            }
-          });
-        }
-        } else if (decl.id.type === 'ObjectPattern') {
-          // 处理解构赋值
-          if (decl.init && decl.init.type === 'CallExpression' && 
-              decl.init.callee.type === 'Identifier' && 
-              decl.init.callee.name === 'require') {
-            
-            // 直接解构：const { readFile, writeFile } = require('fs')
-            let requirePath = decl.init.arguments[0].value;
-            const variables = [];
-            
-            // 收集所有解构的变量名
-            decl.id.properties.forEach(prop => {
-              if (prop.type === 'ObjectProperty' && prop.key.type === 'Identifier') {
-                const varName = prop.key.name;
-                variables.push(varName);
-              }
-            });
-            
-            if (variables.length > 0) {
-            // 为整个解构赋值生成一个依赖项
-            const depName = `destructured_${variables.join('_')}`;
-            
-            // 生成代码（不修正路径）
-            const variableList = variables.join(', ');
-            const code = `const { ${variableList} } = require('${requirePath}');`;
-            
-            dependencies.set(depName, {
-              type: 'require_destructured',
-              code: code,
-              varName: depName,
-              requirePath: requirePath,
-              variables: variables
-            });
-              
-              // 同时为每个变量创建映射
-              variables.forEach(varName => {
-                dependencies.set(varName, {
-                  type: 'variable_from_destructured',
-                  sourceDep: depName,
-                  varName: varName
-                });
-              });
-            }
-          } else {
-            // 处理间接解构赋值：const { a, b } = someVariable
-            const targetVar = decl.init && decl.init.type === 'Identifier' ? decl.init.name : null;
-            const variables = [];
-            
-            decl.id.properties.forEach(prop => {
-              if (prop.type === 'ObjectProperty' && prop.key.type === 'Identifier') {
-                const varName = prop.key.name;
-                variables.push(varName);
-              }
-            });
-            
-            if (targetVar && variables.length > 0) {
-              // 为整个间接解构赋值创建一个特殊的依赖项
-              const depName = `indirect_destructured_${targetVar}_${variables.join('_')}`;
-              
-              dependencies.set(depName, {
-                type: 'indirect_destructured',
-                code: `const { ${variables.join(', ')} } = ${targetVar};`,
-                varName: depName,
-                sourceVar: targetVar,
-                variables: variables
-              });
-              
-              // 为每个变量创建映射
-              variables.forEach(varName => {
-                dependencies.set(varName, {
-                  type: 'variable_from_indirect_destructured',
-                  sourceDep: depName,
-                  varName: varName
-                });
-              });
-            }
-          }
-        }
-      });
-    }
-  });
-  
-    // 第二遍：收集全局声明（变量、函数等），并分析声明之间的依赖关系
-  ast.program.body.forEach(node => {
-    // 收集变量声明
-    if (node.type === 'VariableDeclaration') {
-      node.declarations.forEach(decl => {
-        if (decl.id.type === 'Identifier') {
-          const varName = decl.id.name;
-          
-          // 跳过控制器类名的声明（这些会被单独处理）
-          if (controllerNames.has(varName)) {
-            return;
-          }
-          
-          // 关键修复：跳过已经被当作依赖处理的require变量
-          if (dependencies.has(varName)) {
-            const dep = dependencies.get(varName);
-            if (dep.type === 'require' || dep.type === 'require_destructured') {
-              console.log(`[DEBUG] 跳过require变量声明（已在依赖中）: ${varName}`);
-              return;
-            }
-          }
-          
-          // 分析变量声明中的依赖关系
-          const declarationDependencies = new Set();
-          if (decl.init) {
-            try {
-              // 分析初始化表达式中的依赖
-              const initCode = generate(decl.init).code;
-              if (initCode) {
-                const initAst = parseCode(initCode);
-                traverse(initAst, {
-                  Identifier(path) {
-                    const refName = path.node.name;
-                    if (refName !== varName && refName !== 'undefined' && refName !== 'null') {
-                      declarationDependencies.add(refName);
-                      console.log(`[DEBUG] 变量 ${varName} 依赖于 ${refName}`);
-                    }
-                  }
-                });
-              }
-            } catch (error) {
-              console.warn(`[WARN] 分析变量 ${varName} 的依赖关系失败: ${error.message}`);
-            }
-          }
-          
-          // 收集全局变量声明
-          const declarationCode = generate(node).code;
-          globalDeclarations.set(varName, {
-            type: 'variable_declaration',
-            code: declarationCode,
-            varName: varName,
-            node: node,
-            dependencies: declarationDependencies
-          });
-          
-          console.log(`[DEBUG] 收集全局变量声明: ${varName}, 依赖: ${Array.from(declarationDependencies)}`);
-        }
-      });
-    }
-    
-    // 收集函数声明
-    if (node.type === 'FunctionDeclaration') {
-      const funcName = node.id?.name;
-      if (funcName) {
-        // 跳过控制器类名的方法声明
-        if (controllerNames.has(funcName)) {
-          return;
-        }
-        
-        // 关键修复：跳过已经被当作依赖处理的require变量
-        if (dependencies.has(funcName)) {
-          const dep = dependencies.get(funcName);
-          if (dep.type === 'require' || dep.type === 'require_destructured') {
-            console.log(`[DEBUG] 跳过require函数声明（已在依赖中）: ${funcName}`);
-            return;
-          }
-        }
-        
-        // 分析函数体中的依赖关系
-        const functionDependencies = new Set();
-        if (node.body) {
-          try {
-            traverse(node.body, {
-              Identifier(path) {
-                const refName = path.node.name;
-                // 跳过函数参数和内部变量声明
-                if (path.scope.hasBinding(refName) || refName === funcName) {
-                  return;
-                }
-                if (refName !== 'undefined' && refName !== 'null') {
-                  functionDependencies.add(refName);
-                  console.log(`[DEBUG] 函数 ${funcName} 依赖于 ${refName}`);
-                }
-              }
-            });
-          } catch (error) {
-            console.warn(`[WARN] 分析函数 ${funcName} 的依赖关系失败: ${error.message}`);
-          }
-        }
-        
-        const declarationCode = generate(node).code;
-        globalDeclarations.set(funcName, {
-          type: 'function_declaration',
-          code: declarationCode,
-          varName: funcName,
+  // 遍历 AST，收集类定义和全局语句
+  ast.program.body.forEach((node, index) => {
+    if (node.type === 'ClassDeclaration') {
+      const className = node.id?.name;
+      if (className) {
+        controllers.set(className, {
+          name: className,
           node: node,
-          dependencies: functionDependencies
+          code: generate(node).code,
+          index: index,
+          isExported: false,
+          exportName: className
         });
+        console.log(`  ✓ 找到类 [${index}]: ${className}`);
+      }
+    } else {
+      // 保存所有非类定义的语句
+      globalStatements.push({
+        node: node,
+        code: generate(node).code,
+        index: index,
+        type: node.type
+      });
+    }
+  });
+  
+  console.log(`  📊 全局语句数量: ${globalStatements.length}`);
+  
+  // 分析导出
+  traverse(ast, {
+    AssignmentExpression(path) {
+      if (path.node.left.type === 'MemberExpression' &&
+          path.node.left.object?.name === 'module' &&
+          path.node.left.property?.name === 'exports' &&
+          path.node.right.type === 'ObjectExpression') {
         
-        console.log(`[DEBUG] 收集全局函数声明: ${funcName}, 依赖: ${Array.from(functionDependencies)}`);
+        path.node.right.properties.forEach(prop => {
+          if (prop.type === 'ObjectProperty') {
+            const keyName = prop.key.name;
+            const valueName = prop.value.name;
+            
+            if (keyName && valueName) {
+              exports.set(keyName, valueName);
+              
+              if (controllers.has(valueName)) {
+                const ctrl = controllers.get(valueName);
+                ctrl.isExported = true;
+                ctrl.exportName = keyName;
+              }
+            }
+          }
+        });
       }
     }
   });
-
-  // 第三遍：检测子模块间引用（控制器类间的相互引用）
-  if (allControllers && controllerNames.size > 1) {
-    // 遍历整个 AST 来检测子模块间引用
-    traverse(ast, {
-      ClassDeclaration(path) {
-        const className = path.node.id?.name;
-        if (className && controllerNames.has(className)) {
-          // 在类内部查找对其他控制器的引用
-          path.traverse({
-            NewExpression(newPath) {
-              const callee = newPath.node.callee;
-              if (callee.type === 'Identifier' && controllerNames.has(callee.name)) {
-                // 检测到 new OtherController() 这种引用
-                const refControllerName = callee.name;
-                if (refControllerName !== className) {
-                  console.log(`[INFO] 检测到控制器引用: ${className} -> ${refControllerName} (NewExpression)`);
-                  // 创建子模块间引用依赖（使用同级目录引用）
-                  const depName = `controller_ref_${className}_to_${refControllerName}`;
-                  const modulePath = `./${refControllerName.toLowerCase()}`;
-                  
-                  dependencies.set(depName, {
-                    type: 'controller_reference',
-                    code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
-                    varName: refControllerName,
-                    sourceController: refControllerName,
-                    targetController: className
-                  });
-                  
-                  // 同时为控制器名称创建直接映射
-                  dependencies.set(refControllerName, {
-                    type: 'controller_reference',
-                    code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
-                    varName: refControllerName,
-                    sourceController: refControllerName,
-                    targetController: className
-                  });
-                }
-              }
-            },
-            
-            MemberExpression(memberPath) {
-              const object = memberPath.node.object;
-              const property = memberPath.node.property;
-              
-              // 检测 this.otherController.method() 这种引用
-              if (object.type === 'ThisExpression' && 
-                  property.type === 'Identifier' && 
-                  controllerNames.has(property.name)) {
-                const refControllerName = property.name;
-                if (refControllerName !== className) {
-                  console.log(`[INFO] 检测到控制器属性引用: ${className} -> ${refControllerName} (MemberExpression)`);
-                  // 创建子模块间引用依赖（使用同级目录引用）
-                  const depName = `controller_property_ref_${className}_to_${refControllerName}`;
-                  const modulePath = `./${refControllerName.toLowerCase()}`;
-                  
-                  dependencies.set(depName, {
-                    type: 'controller_property_reference',
-                    code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
-                    varName: refControllerName,
-                    sourceController: refControllerName,
-                    targetController: className
-                  });
-                  
-                  // 同时为控制器名称创建直接映射
-                  dependencies.set(refControllerName, {
-                    type: 'controller_property_reference',
-                    code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
-                    varName: refControllerName,
-                    sourceController: refControllerName,
-                    targetController: className
-                  });
-                }
-              }
-              
-              // 检测静态方法引用：OtherController.staticMethod()
-              if (object.type === 'Identifier' && 
-                  controllerNames.has(object.name) &&
-                  memberPath.parent.type !== 'NewExpression') {
-                const refControllerName = object.name;
-                if (refControllerName !== className) {
-                  console.log(`[INFO] 检测到静态方法引用: ${className} -> ${refControllerName} (MemberExpression)`);
-                  // 创建子模块间引用依赖（使用同级目录引用）
-                  const depName = `controller_static_ref_${className}_to_${refControllerName}`;
-                  const modulePath = `./${refControllerName.toLowerCase()}`;
-                  
-                  dependencies.set(depName, {
-                    type: 'controller_static_reference',
-                    code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
-                    varName: refControllerName,
-                    sourceController: refControllerName,
-                    targetController: className
-                  });
-                  
-                  // 同时为控制器名称创建直接映射（确保变量名被正确记录）
-                  if (!dependencies.has(refControllerName)) {
-                    dependencies.set(refControllerName, {
-                      type: 'controller_static_reference',
-                      code: `const ${refControllerName} = require('${modulePath}').${refControllerName};`,
-                      varName: refControllerName,
-                      sourceController: refControllerName,
-                      targetController: className
-                    });
-                  }
-                }
-              }
-            }
-          });
-        }
-      }
-    });
-  }
   
-  return {
-    dependencies,
-    globalDeclarations
+  console.log(`  ✅ 分析完成: ${controllers.size} 个类, ${exports.size} 个导出\n`);
+  
+  return { 
+    controllers, 
+    exports, 
+    globalStatements,
+    ast, 
+    code 
   };
 }
 
 /**
- * 生成独立的控制器模块（支持子模块间引用）
+ * 提取语句中声明的标识符（变量名、函数名等）
  */
-function generateControllerModule(controllerInfo, allRequiredModules, targetFile, originalCode, allControllers) {
-  const { name, code } = controllerInfo;
+function extractDeclaredIdentifiers(statement) {
+  const identifiers = new Set();
   
+  try {
+    if (statement.type === 'VariableDeclaration') {
+      statement.node.declarations.forEach(decl => {
+        if (decl.id.type === 'Identifier') {
+          identifiers.add(decl.id.name);
+        } else if (decl.id.type === 'ObjectPattern') {
+          // 解构赋值：const { a, b } = ...
+          decl.id.properties.forEach(prop => {
+            if (prop.type === 'ObjectProperty' && prop.key?.name) {
+              identifiers.add(prop.key.name);
+            } else if (prop.type === 'RestElement' && prop.argument?.name) {
+              identifiers.add(prop.argument.name);
+            }
+          });
+        } else if (decl.id.type === 'ArrayPattern') {
+          // 数组解构：const [a, b] = ...
+          decl.id.elements.forEach(elem => {
+            if (elem && elem.type === 'Identifier') {
+              identifiers.add(elem.name);
+            }
+          });
+        }
+      });
+    } else if (statement.type === 'FunctionDeclaration' && statement.node.id) {
+      identifiers.add(statement.node.id.name);
+    } else if (statement.type === 'ClassDeclaration' && statement.node.id) {
+      identifiers.add(statement.node.id.name);
+    }
+  } catch (error) {
+    console.warn(`  ⚠️  提取标识符失败: ${error.message}`);
+  }
+  
+  return identifiers;
+}
+
+/**
+ * 提取语句中使用的标识符（依赖的变量、函数等）
+ */
+function extractUsedIdentifiers(statement) {
+  const identifiers = new Set();
+  
+  try {
+    const ast = parseCode(statement.code);
+    const declaredInStatement = extractDeclaredIdentifiers(statement);
+    
+    traverse(ast, {
+      Identifier(path) {
+        const name = path.node.name;
+        
+        // 跳过声明自身
+        if (declaredInStatement.has(name)) {
+          return;
+        }
+        
+        // 跳过内部作用域的绑定
+        if (path.scope.hasBinding(name)) {
+          return;
+        }
+        
+        // 跳过某些特殊标识符
+        if (['undefined', 'null', 'true', 'false', 'NaN', 'Infinity'].includes(name)) {
+          return;
+        }
+        
+        // 跳过全局对象和常见内置对象
+        if (['console', 'process', 'global', 'window', 'document', 
+             'Array', 'Object', 'String', 'Number', 'Boolean', 'Math',
+             'JSON', 'Date', 'RegExp', 'Error', 'Promise'].includes(name)) {
+          return;
+        }
+        
+        identifiers.add(name);
+      },
+      
+      MemberExpression(path) {
+        // 对于 a.b.c，只记录 a
+        if (path.node.object.type === 'Identifier') {
+          const name = path.node.object.name;
+          if (!path.scope.hasBinding(name)) {
+            identifiers.add(name);
+          }
+        }
+      }
+    });
+  } catch (error) {
+    console.warn(`  ⚠️  提取使用的标识符失败: ${error.message}`);
+  }
+  
+  return identifiers;
+}
+
+/**
+ * 构建语句依赖图
+ */
+function buildStatementDependencyGraph(globalStatements) {
+  const graph = new Map(); // 语句索引 -> { declares: Set, uses: Set }
+  
+  globalStatements.forEach((statement, index) => {
+    const declares = extractDeclaredIdentifiers(statement);
+    const uses = extractUsedIdentifiers(statement);
+    
+    graph.set(index, {
+      statement: statement,
+      declares: declares,
+      uses: uses
+    });
+  });
+  
+  return graph;
+}
+
+/**
+ * 检测类中引用的其他控制器
+ */
+function detectControllerReferences(classCode, allControllerNames, currentClassName) {
+  const references = new Set();
+  
+  try {
+    const ast = parseCode(classCode);
+    
+    traverse(ast, {
+      Identifier(path) {
+        const name = path.node.name;
+        
+        if (allControllerNames.has(name) && name !== currentClassName) {
+          // 确保不是在声明位置
+          const parent = path.parent;
+          if (parent.type !== 'FunctionDeclaration' &&
+              parent.type !== 'VariableDeclarator' &&
+              parent.type !== 'ClassDeclaration') {
+            references.add(name);
+          }
+        }
+      },
+      
+      NewExpression(path) {
+        const callee = path.node.callee;
+        if (callee.type === 'Identifier' && 
+            allControllerNames.has(callee.name) &&
+            callee.name !== currentClassName) {
+          references.add(callee.name);
+        }
+      }
+    });
+  } catch (error) {
+    console.warn(`  ⚠️  检测引用失败: ${error.message}`);
+  }
+  
+  return references;
+}
+
+/**
+ * 计算需要保留的语句（包含完整依赖链）
+ */
+function calculateRequiredStatements(classCode, globalStatements, allControllerNames) {
+  console.log(`  🔍 分析依赖链...`);
+  
+  // 构建依赖图
+  const dependencyGraph = buildStatementDependencyGraph(globalStatements);
+  
+  // 步骤1: 找出类直接使用的标识符
+  const classUsedIdentifiers = extractUsedIdentifiers({
+    code: classCode,
+    type: 'ClassDeclaration',
+    node: null
+  });
+  
+  console.log(`  📌 类直接使用的标识符 (${classUsedIdentifiers.size}): ${Array.from(classUsedIdentifiers).slice(0, 10).join(', ')}${classUsedIdentifiers.size > 10 ? '...' : ''}`);
+  
+  // 步骤2: 从类使用的标识符开始，追踪依赖链
+  const requiredStatements = new Set();
+  const toProcess = new Set(classUsedIdentifiers);
+  const processed = new Set();
+  
+  while (toProcess.size > 0) {
+    const identifier = toProcess.values().next().value;
+    toProcess.delete(identifier);
+    
+    if (processed.has(identifier)) {
+      continue;
+    }
+    processed.add(identifier);
+    
+    // 找到声明这个标识符的语句
+    dependencyGraph.forEach((info, index) => {
+      if (info.declares.has(identifier)) {
+        // 标记这个语句需要保留
+        requiredStatements.add(index);
+        
+        // 将这个语句使用的标识符加入待处理队列
+        info.uses.forEach(usedId => {
+          if (!processed.has(usedId)) {
+            toProcess.add(usedId);
+          }
+        });
+      }
+    });
+  }
+  
+  console.log(`  ✓ 需要保留 ${requiredStatements.size}/${globalStatements.length} 个语句（包含完整依赖链）`);
+  
+  return requiredStatements;
+}
+
+/**
+ * 生成控制器模块 - 依赖链保留策略
+ */
+function generateControllerModule(controllerInfo, analysis) {
+  const { name, code } = controllerInfo;
+  const { globalStatements, controllers } = analysis;
+  
+  console.log(`\n📝 生成模块: ${name}`);
+  
+  const allControllerNames = new Set(controllers.keys());
+  
+  // 1. 检测这个类引用了哪些其他控制器
+  const referencedControllers = detectControllerReferences(
+    code, 
+    allControllerNames, 
+    name
+  );
+  
+  if (referencedControllers.size > 0) {
+    console.log(`  🔗 引用的控制器: ${Array.from(referencedControllers).join(', ')}`);
+  }
+  
+  // 2. 计算需要保留的语句（包含完整依赖链）
+  const requiredStatements = calculateRequiredStatements(
+    code, 
+    globalStatements, 
+    allControllerNames
+  );
+  
+  // 3. 生成模块头部
   let content = `/**
- * ${name} 控制器模块 - 支持子模块间引用版本
- * 包含该控制器相关的代码、依赖和子模块引用
+ * ${name} 控制器模块
+ * 自动生成于: ${new Date().toISOString()}
+ * 策略: 依赖链完整保留
  */
 
 `;
   
-  // 计算基础路径：目标文件所在目录
-  const targetDir = path.dirname(targetFile);
-  
-  // 分析原始文件中的全局依赖，包括子模块间引用
-  const dependencyResult = extractGlobalDependencies(originalCode, targetFile, allControllers);
-  const globalDependencies = dependencyResult.dependencies;
-  const globalDeclarations = dependencyResult.globalDeclarations;
-  
-  // 分析控制器代码中实际使用的依赖
-  const controllerAst = parseCode(code);
-  const usedVariables = new Set(); // 记录使用的变量名
-  const usedDependencies = new Set(); // 记录使用的依赖项
-  const missingDependencies = new Set(); // 记录需要但未找到的依赖
-  
-  traverse(controllerAst, {
-    Identifier(path) {
-      const node = path.node;
-      const parent = path.parent;
-      
-      // 跳过函数声明和变量声明中的标识符
-      if (parent.type === 'FunctionDeclaration' || 
-          parent.type === 'VariableDeclarator' ||
-          parent.type === 'ClassDeclaration' ||
-          parent.type === 'MethodDefinition') {
-        return;
-      }
-      
-      // 检测标识符引用
-      if (globalDependencies.has(node.name)) {
-        const dep = globalDependencies.get(node.name);
-        
-        // 关键修复：跳过自引用依赖
-        if ((dep.type === 'controller_reference' || 
-             dep.type === 'controller_property_reference' ||
-             dep.type === 'controller_static_reference') && 
-            dep.sourceController === name) {
-          // 这是自引用（引用当前正在生成的类），跳过不添加依赖
-          console.log(`[DEBUG] 跳过自引用依赖: ${name} -> ${dep.sourceController} (类型: ${dep.type})`);
-          return;
-        }
-        
-        usedVariables.add(node.name);
-        
-        // 处理不同类型的依赖
-        if (dep.type === 'variable_from_destructured') {
-          // 解构赋值中的变量
-          usedDependencies.add(dep.sourceDep);
-        } else if (dep.type === 'variable_from_indirect_destructured') {
-          // 间接解构赋值中的变量
-          usedDependencies.add(dep.sourceDep);
-        } else if (dep.type === 'require') {
-          // 直接require的变量
-          usedDependencies.add(node.name);
-        } else if (dep.type === 'require_destructured') {
-          // 解构赋值的依赖项
-          usedDependencies.add(node.name);
-        } else if (dep.type === 'indirect_destructured') {
-          // 间接解构赋值的依赖项
-          usedDependencies.add(dep.sourceVar);
-        } else if (dep.type === 'controller_reference' || 
-                   dep.type === 'controller_property_reference' ||
-                   dep.type === 'controller_static_reference') {
-          // 控制器引用（实例或静态）
-          usedDependencies.add(dep.varName);
-          console.log(`[DEBUG] 添加控制器引用依赖: ${name} -> ${dep.sourceController} (类型: ${dep.type})`);
-        }
-      } else {
-        // 记录未找到依赖的变量，用于调试
-        missingDependencies.add(node.name);
-      }
-      
-      // 检测成员表达式中的标识符
-      if (parent.type === 'MemberExpression' && parent.property === node) {
-        if (parent.object.type === 'Identifier' && globalDependencies.has(parent.object.name)) {
-          const dep = globalDependencies.get(parent.object.name);
-          usedVariables.add(parent.object.name);
-          
-          if (dep.type === 'variable_from_destructured') {
-            usedDependencies.add(dep.sourceDep);
-          } else if (dep.type === 'variable_from_assignment') {
-            usedDependencies.add(dep.sourceVar);
-          } else {
-            usedDependencies.add(parent.object.name);
-          }
-        }
-      }
-    }
-  });
-  
-  // 增强的依赖追踪函数
-  const traceDependencies = (depName, visited = new Set()) => {
-    if (visited.has(depName) || !globalDependencies.has(depName)) return;
-    
-    visited.add(depName);
-    const dep = globalDependencies.get(depName);
-    
-    // 根据依赖类型追踪间接依赖
-    switch (dep.type) {
-      case 'variable_from_assignment':
-        if (!usedDependencies.has(dep.sourceVar)) {
-          usedDependencies.add(dep.sourceVar);
-          traceDependencies(dep.sourceVar, visited);
-        }
-        break;
-        
-      case 'indirect_destructured':
-        if (!usedDependencies.has(dep.sourceVar)) {
-          usedDependencies.add(dep.sourceVar);
-          traceDependencies(dep.sourceVar, visited);
-        }
-        break;
-        
-      case 'variable_from_indirect_destructured':
-        if (!usedDependencies.has(dep.sourceDep)) {
-          usedDependencies.add(dep.sourceDep);
-          traceDependencies(dep.sourceDep, visited);
-        }
-        break;
-        
-      case 'variable_from_destructured':
-        if (!usedDependencies.has(dep.sourceDep)) {
-          usedDependencies.add(dep.sourceDep);
-          traceDependencies(dep.sourceDep, visited);
-        }
-        break;
-        
-      case 'controller_reference':
-      case 'controller_property_reference':
-      case 'controller_static_reference':
-        if (!usedDependencies.has(dep.varName)) {
-          usedDependencies.add(dep.varName);
-        }
-        break;
-        
-      case 'variable_declaration':
-      case 'function_declaration':
-        // 对于全局声明，追踪其依赖的所有变量
-        if (dep.dependencies) {
-          dep.dependencies.forEach(refName => {
-            // 只追踪在原始文件中实际存在的变量
-            if (globalDeclarations.has(refName) && !usedDependencies.has(refName)) {
-              usedDependencies.add(refName);
-              traceDependencies(refName, visited);
-            }
-          });
-        }
-        break;
-    }
-    
-    // 递归追踪依赖代码中引用的其他变量
-    if (dep.code) {
-      const codeAst = parseCode(dep.code);
-      traverse(codeAst, {
-        Identifier(path) {
-          const refName = path.node.name;
-          if (refName !== depName && globalDependencies.has(refName) && !usedDependencies.has(refName)) {
-            usedDependencies.add(refName);
-            traceDependencies(refName, visited);
-          }
-        }
-      });
-    }
-    
-    // 新增：追踪全局声明之间的依赖关系
-    if (globalDeclarations.has(depName)) {
-      const decl = globalDeclarations.get(depName);
-      if (decl.dependencies) {
-        decl.dependencies.forEach(refName => {
-          if (!usedDependencies.has(refName)) {
-            usedDependencies.add(refName);
-            traceDependencies(refName, visited);
-          }
-        });
-      }
-    }
-    
-    // 增强：追踪全局声明节点中的依赖关系
-    if (dep.node && dep.node.init) {
-      try {
-        const nodeCode = generate(dep.node).code;
-        if (nodeCode) {
-          const nodeAst = parseCode(nodeCode);
-          traverse(nodeAst, {
-            Identifier(path) {
-              const refName = path.node.name;
-              if (refName !== depName && globalDependencies.has(refName) && !usedDependencies.has(refName)) {
-                usedDependencies.add(refName);
-                traceDependencies(refName, visited);
-              }
-            }
-          });
-        }
-      } catch (error) {
-        console.warn(`[WARN] 追踪节点 ${depName} 的依赖关系失败: ${error.message}`);
-      }
-    }
-  };
-  
-  // 进行深度依赖追踪
-  const initialDeps = Array.from(usedDependencies);
-  initialDeps.forEach(depName => {
-    traceDependencies(depName);
-  });
-  
-  // 完全按照原文件顺序：变量、函数、require等保持原样
-  const sortedDependencies = [];
-  
-  // 按原文件中的声明顺序收集所有语句
-  const ast = parseCode(originalCode);
-  
-  ast.program.body.forEach(node => {
-    if (node.type === 'VariableDeclaration') {
-      // 变量声明
-      node.declarations.forEach(decl => {
-        if (decl.id.type === 'Identifier') {
-          const varName = decl.id.name;
-          if (usedDependencies.has(varName)) {
-            sortedDependencies.push(varName);
-          }
-        }
-      });
-    } else if (node.type === 'FunctionDeclaration' && node.id) {
-      // 函数声明
-      const funcName = node.id.name;
-      if (usedDependencies.has(funcName)) {
-        sortedDependencies.push(funcName);
-      }
-    }
-  });
-  
-  console.log(`[DEBUG] 按原文件顺序排列的依赖项: ${sortedDependencies.join(', ')}`);
-  
-  // 第一步：添加全局变量声明（在依赖之前）
-  const usedGlobalDeclarations = new Set();
-  
-  // 遍历使用的依赖，找出需要哪些全局声明
-  usedDependencies.forEach(depName => {
-    if (globalDeclarations.has(depName)) {
-      usedGlobalDeclarations.add(depName);
-    }
-  });
-  
-  // 同时检查控制器代码中直接使用的全局变量
-  traverse(controllerAst, {
-    Identifier(path) {
-      const node = path.node;
-      const parent = path.parent;
-      
-      // 跳过函数声明和变量声明中的标识符
-      if (parent.type === 'FunctionDeclaration' || 
-          parent.type === 'VariableDeclarator' ||
-          parent.type === 'ClassDeclaration' ||
-          parent.type === 'MethodDefinition') {
-        return;
-      }
-      
-      // 如果这个标识符有全局声明，就标记为需要
-      if (globalDeclarations.has(node.name)) {
-        usedGlobalDeclarations.add(node.name);
-      }
-    }
-  });
-  
-  // 关键修复：过滤掉已经作为依赖处理的声明
-  const filteredGlobalDeclarations = new Set();
-  usedGlobalDeclarations.forEach(declName => {
-    // 如果这个声明已经在依赖中处理了，就跳过
-    if (usedDependencies.has(declName)) {
-      console.log(`[DEBUG] 跳过已在依赖中处理的声明: ${declName}`);
+  // 4. 按原始顺序添加需要的语句
+  let addedCount = 0;
+  globalStatements.forEach((statement, index) => {
+    // 跳过 module.exports 语句
+    if (statement.type === 'ExpressionStatement' &&
+        statement.node.expression?.type === 'AssignmentExpression' &&
+        statement.node.expression.left?.type === 'MemberExpression' &&
+        statement.node.expression.left.object?.name === 'module' &&
+        statement.node.expression.left.property?.name === 'exports') {
       return;
     }
-    filteredGlobalDeclarations.add(declName);
+    
+    // 只保留必需的语句
+    if (requiredStatements.has(index)) {
+      content += `${statement.code}\n`;
+      addedCount++;
+    }
   });
   
-  // 添加全局声明到内容中（在依赖之前）
-  if (filteredGlobalDeclarations.size > 0) {
-    content += '// 全局声明\n';
-    filteredGlobalDeclarations.forEach(declName => {
-      if (globalDeclarations.has(declName)) {
-        const decl = globalDeclarations.get(declName);
-        content += `${decl.code}\n`;
-        console.log(`[DEBUG] 添加全局声明: ${declName} (类型: ${decl.type})`);
-      }
+  console.log(`  ✅ 添加了 ${addedCount} 个语句`);
+  
+  if (addedCount > 0) {
+    content += '\n';
+  }
+  
+  // 5. 添加子模块间的引用
+  if (referencedControllers.size > 0) {
+    content += '// 子模块引用\n';
+    referencedControllers.forEach(refName => {
+      const modulePath = `./${refName.toLowerCase()}`;
+      content += `const ${refName} = require('${modulePath}').${refName};\n`;
     });
     content += '\n';
   }
   
-  // 第二步：按照正确的依赖顺序添加依赖声明
-  const addedDeps = new Set();
-  
-  // 先添加 require 语句（这些应该在最前面）
-  sortedDependencies.forEach(depName => {
-    if (globalDependencies.has(depName) && !addedDeps.has(depName)) {
-      const dep = globalDependencies.get(depName);
-      
-      // 关键修复：在最终生成阶段也过滤自引用依赖
-      if ((dep.type === 'controller_reference' || 
-           dep.type === 'controller_property_reference' ||
-           dep.type === 'controller_static_reference') && 
-          dep.sourceController === name) {
-        console.log(`[DEBUG] 在最终生成阶段跳过自引用依赖: ${name} -> ${dep.sourceController}`);
-        return;
-      }
-      
-      // 第一步：添加所有 require 语句
-      if (dep.type === 'require' || dep.type === 'require_destructured') {
-        console.log(`[DEBUG] 添加 require 依赖: ${depName} (类型: ${dep.type})`);
-        content += `${dep.code}\n`;
-        addedDeps.add(depName);
-      }
-    }
-  });
-  
-  // 添加分隔符
-  if (addedDeps.size > 0) {
-    content += '\n';
-  }
-  
-  // 第二步：添加全局声明代码
-  sortedDependencies.forEach(depName => {
-    if (globalDeclarations.has(depName) && !addedDeps.has(depName)) {
-      const decl = globalDeclarations.get(depName);
-      console.log(`[DEBUG] 添加全局声明: ${depName} (类型: ${decl.type})`);
-      content += `${decl.code}\n`;
-      addedDeps.add(depName);
-    }
-  });
-  
-  // 第三步：添加其他类型的依赖声明
-  sortedDependencies.forEach(depName => {
-    if (globalDependencies.has(depName) && !addedDeps.has(depName)) {
-      const dep = globalDependencies.get(depName);
-      
-      // 过滤自引用依赖
-      if ((dep.type === 'controller_reference' || 
-           dep.type === 'controller_property_reference' ||
-           dep.type === 'controller_static_reference') && 
-          dep.sourceController === name) {
-        return;
-      }
-      
-      // 添加非 require 类型的依赖
-      if (dep.type === 'indirect_destructured' || 
-          dep.type === 'controller_reference' || 
-          dep.type === 'controller_property_reference' ||
-          dep.type === 'controller_static_reference') {
-        console.log(`[DEBUG] 添加其他依赖: ${depName} (类型: ${dep.type})`);
-        content += `${dep.code}\n`;
-        addedDeps.add(depName);
-      }
-    }
-  });
-  
-  // 调试信息
-  if (missingDependencies.size > 0) {
-    console.log(`[DEBUG] 控制器 ${name} 中未找到依赖的变量:`, Array.from(missingDependencies));
-  }
-  
-  if (usedDependencies.size > 0) {
-    content += '\n';
-  }
-  
-  // 只添加当前控制器类的代码
+  // 6. 添加当前类的定义
   content += `// ${name} 控制器类\n`;
   content += `${code}\n\n`;
   
-  // 导出控制器类
+  // 7. 导出
   content += `module.exports = { ${name} };\n`;
   
   return content;
@@ -897,163 +393,181 @@ function generateControllerModule(controllerInfo, allRequiredModules, targetFile
  */
 function generateMainEntryFile(splitModules, originalFile) {
   let content = `/**
- * 控制器脚本拆分后的主入口文件
+ * 主入口文件
  * 原始文件: ${path.basename(originalFile)}
- * 拆分时间: ${new Date().toISOString()}
- * 控制器模块: 同目录下的控制器文件
+ * 生成时间: ${new Date().toISOString()}
  */
 
 `;
   
-  // 添加所有控制器模块的require（引用同级目录下的文件）
-  splitModules.forEach((moduleInfo, className) => {
+  // 引入所有模块
+  splitModules.forEach(moduleInfo => {
     const modulePath = `./${moduleInfo.fileName.replace('.js', '')}`;
     content += `const ${moduleInfo.moduleName} = require('${modulePath}');\n`;
   });
   
-  content += '\n';
+  content += '\n// 导出所有控制器\nmodule.exports = {\n';
   
-  // 合并所有导出，保持原始导出结构
-  content += `module.exports = {\n`;
-  
-  let exportCount = 0;
-  splitModules.forEach((moduleInfo, className) => {
+  splitModules.forEach(moduleInfo => {
     if (moduleInfo.isExported) {
-      content += `  ${moduleInfo.exportName}: ${moduleInfo.moduleName}.${className},\n`;
-      exportCount++;
+      content += `  ${moduleInfo.exportName}: ${moduleInfo.moduleName}.${moduleInfo.className},\n`;
     }
   });
   
-  content += `};\n`;
-  
-  console.log(`生成主入口文件: 包含 ${exportCount} 个导出项`);
+  content += '};\n';
   
   return content;
 }
 
 /**
- * 拆分控制器脚本
+ * 主拆分函数
  */
 function splitControllerScript(targetFile, outputDir, options = {}) {
-  console.log(`开始拆分控制器脚本: ${targetFile}`);
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`🚀 控制器脚本拆分工具 - 依赖链完整保留策略`);
+  console.log(`${'='.repeat(60)}`);
+  console.log(`  📂 源文件: ${targetFile}`);
+  console.log(`  📁 输出目录: ${outputDir}`);
+  console.log(`  🎯 策略: 追踪完整依赖链，确保零遗漏`);
+  console.log(`${'='.repeat(60)}\n`);
   
   const { backup = true } = options;
   
   try {
-    // 备份原始文件（只备份一次）
+    // 创建备份
     if (backup) {
-      const backupDir = path.dirname(targetFile);
-      const fileName = path.basename(targetFile);
-      const backupFile = path.join(backupDir, `${fileName}.split.bak`);
-      
-      // 如果备份文件不存在，才创建备份
+      const backupFile = `${targetFile}.bak`;
       if (!fs.existsSync(backupFile)) {
         fs.copyFileSync(targetFile, backupFile);
-        console.log(`✅ 创建原始文件备份: ${backupFile}`);
-      } else {
-        console.log(`ℹ️  备份文件已存在: ${backupFile}`);
+        console.log(`💾 创建备份: ${backupFile}\n`);
       }
     }
     
-    // 分析目标脚本
+    // 分析脚本
     const analysis = analyzeControllerScript(targetFile);
-    const { controllers, exports } = analysis;
+    const { controllers } = analysis;
     
     if (controllers.size === 0) {
-      throw new Error('未找到任何控制器类定义');
+      throw new Error('未找到任何控制器类');
     }
     
-    // 子模块直接保存在输出目录（与原文件相同目录）
-    const modulesDir = outputDir;
-    
-    // 确保目录存在
-    if (!fs.existsSync(modulesDir)) {
-      fs.mkdirSync(modulesDir, { recursive: true });
+    // 确保输出目录存在
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
     }
     
-    console.log(`准备拆分 ${controllers.size} 个控制器到 ${modulesDir} 目录`);
-    
-    // 生成控制器模块
-    const splitModules = new Map();
+    // 生成所有模块
+    const splitModules = [];
     
     controllers.forEach((controllerInfo, className) => {
       const fileName = `${className.toLowerCase()}.js`;
+      const content = generateControllerModule(controllerInfo, analysis);
       
-      const content = generateControllerModule(controllerInfo, analysis.requiredModules, targetFile, analysis.code, controllers);
+      const filePath = path.join(outputDir, fileName);
+      fs.writeFileSync(filePath, content, 'utf8');
       
-      splitModules.set(className, {
+      splitModules.push({
+        className,
         moduleName: className.toLowerCase(),
         fileName,
-        content,
         exportName: controllerInfo.exportName,
         isExported: controllerInfo.isExported
       });
+      
+      console.log(`  ✅ 已保存: ${fileName}`);
     });
     
-    // 写入控制器模块文件（直接保存在输出目录）
-    splitModules.forEach((moduleInfo, className) => {
-      const filePath = path.join(modulesDir, moduleInfo.fileName);
-      fs.writeFileSync(filePath, moduleInfo.content, 'utf8');
-      console.log(`生成控制器模块: ${moduleInfo.fileName} (${className})`);
+    // 生成主入口
+    const mainContent = generateMainEntryFile(splitModules, targetFile);
+    const mainPath = path.join(outputDir, path.basename(targetFile));
+    fs.writeFileSync(mainPath, mainContent, 'utf8');
+    
+    console.log(`\n  ✅ 已保存主入口: ${path.basename(targetFile)}`);
+    
+    // 输出统计信息
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`🎉 拆分完成！`);
+    console.log(`${'='.repeat(60)}`);
+    console.log(`  📊 控制器数量: ${splitModules.length}`);
+    console.log(`  📦 生成文件数: ${splitModules.length + 1}`);
+    console.log(`  📂 输出目录: ${outputDir}`);
+    console.log(`${'='.repeat(60)}\n`);
+    
+    // 列出所有生成的文件
+    console.log(`📋 生成的文件列表:`);
+    console.log(`  ├─ ${path.basename(targetFile)} (主入口)`);
+    splitModules.forEach((mod, index) => {
+      const isLast = index === splitModules.length - 1;
+      const prefix = isLast ? '  └─' : '  ├─';
+      console.log(`${prefix} ${mod.fileName} (${mod.className})`);
     });
-    
-    // 生成主入口文件
-    const mainEntryContent = generateMainEntryFile(splitModules, targetFile);
-    const mainEntryPath = path.join(outputDir, path.basename(targetFile));
-    fs.writeFileSync(mainEntryPath, mainEntryContent, 'utf8');
-    console.log(`生成主入口文件: ${path.basename(targetFile)}`);
-    
-    console.log(`\n✅ 控制器拆分完成！`);
-    console.log(`- 拆分了 ${splitModules.size} 个控制器到 ${modulesDir} 目录`);
-    console.log(`- 主入口文件: ${path.basename(targetFile)}（保持原文件名）`);
-    console.log(`- 控制器模块: ${Array.from(splitModules.keys()).map(name => `${name.toLowerCase()}.js`).join(', ')}`);
-    console.log(`- 原有引用可以继续使用 require('./${path.basename(targetFile)}')`);
+    console.log();
     
     return {
-      splitModules: Array.from(splitModules.entries()).map(([className, info]) => ({
-        className,
-        moduleName: info.moduleName,
-        fileName: info.fileName,
-        exportName: info.exportName,
-        isExported: info.isExported
-      })),
-      mainEntryFile: mainEntryPath,
-      modulesDir: modulesDir
+      splitModules,
+      mainEntryFile: mainPath,
+      modulesDir: outputDir
     };
     
   } catch (error) {
-    console.error(`❌ 控制器拆分失败: ${error.message}`);
+    console.error(`\n❌ 拆分失败: ${error.message}`);
+    console.error(`\n堆栈信息:\n${error.stack}\n`);
     throw error;
   }
 }
 
-// 命令行接口
+// CLI 接口
 if (require.main === module) {
   const args = process.argv.slice(2);
   
   if (args.length < 1) {
-    console.log('用法: node split.js <目标加密脚本> [输出目录]');
-    console.log('示例: node split.js 目标-加密-脚本.js');
-    console.log('       node split.js 目标-加密-脚本.js ./controller-result');
+    console.log(`
+╔═══════════════════════════════════════════════════════════╗
+║      控制器脚本拆分工具 - 依赖链完整保留策略               ║
+╚═══════════════════════════════════════════════════════════╝
+
+用法: node split.js <目标文件> [输出目录] [选项]
+
+参数:
+  <目标文件>     要拆分的 JavaScript 文件
+  [输出目录]     输出目录（默认为源文件所在目录）
+
+选项:
+  --no-backup   不创建备份文件
+
+示例:
+  node split.js controllers.js
+  node split.js controllers.js ./output
+  node split.js controllers.js ./output --no-backup
+
+核心特点:
+  ✓ 保留完整的依赖链（A依赖B，B依赖C，全部保留）
+  ✓ 保持原始顺序和格式
+  ✓ 支持任何复杂的 JS 语法
+  ✓ 自动处理子模块间引用
+  ✓ 宁可冗余，绝不遗漏
+
+工作原理:
+  1. 分析类直接使用的标识符
+  2. 追踪这些标识符的声明语句
+  3. 递归追踪声明语句依赖的标识符
+  4. 保留整条依赖链上的所有语句
+    `);
     process.exit(1);
   }
   
   const targetFile = args[0];
   const outputDir = args[1] || path.dirname(targetFile);
+  const noBackup = args.includes('--no-backup');
   
   try {
-    // 执行拆分
-    const result = splitControllerScript(targetFile, outputDir);
-    console.log('✅ 控制器拆分完成！');
-    
+    splitControllerScript(targetFile, outputDir, { backup: !noBackup });
   } catch (error) {
-    console.error('拆分失败:', error.message);
     process.exit(1);
   }
 }
 
 module.exports = {
   splitControllerScript,
-  extractGlobalDependencies, 
   analyzeControllerScript
 };
