@@ -183,14 +183,14 @@ function extractStaticFunctionCalls(filePath) {
   traverse(ast, {
     CallExpression(path) {
       if (isStaticFunctionCall(path.node)) {
-        staticCalls.push(path.node);
+        staticCalls.push(path);
       }
     }
   });
 
   const { functions, classes, variables } = extractDefinitions(ast);
   const dependencies = analyzeFunctionDependencies(ast, staticCalls); // 仍保留现有分析，稍后可迭代改进
-  return { staticCalls, functionDefs: functions, classDefs: classes, varDefs: variables, dependencies };
+  return { ast,staticCalls, functionDefs: functions, classDefs: classes, varDefs: variables, dependencies };
 }
 
 // 组装并执行函数（严格模式：缺少定义则跳过，不创建占位对象）
@@ -235,7 +235,8 @@ function assembleAndExecuteFunctions(staticCalls, functionDefs, dependencies, cl
     }
   });
 
-  for (const call of staticCalls) {
+  for (const callAst of staticCalls) {
+    const call = callAst.node;
     const fullName = getCalleeFullName(call.callee);
     if (!fullName) { console.warn('无法识别的函数调用，跳过执行'); continue; }
 
@@ -252,7 +253,7 @@ function assembleAndExecuteFunctions(staticCalls, functionDefs, dependencies, cl
       if (typeof context[funcName] !== 'function') { console.warn(`函数 ${funcName} 未找到定义，跳过执行`); continue; }
       try {
         const result = context[funcName](...args);
-        results.push({ function: funcName, arguments: args, result });
+        results.push({callAst, function: funcName, arguments: args, result });
       } catch (e) {
         console.error(`执行函数 ${funcName} 时出错:`, e);
       }
@@ -283,7 +284,7 @@ function assembleAndExecuteFunctions(staticCalls, functionDefs, dependencies, cl
       }
       try {
         const result = context[objName][methodName](...args);
-        results.push({ function: `${objName}.${methodName}`, arguments: args, result });
+        results.push({callAst, function: `${objName}.${methodName}`, arguments: args, result });
       } catch (e) { console.error(`执行类静态方法 ${objName}.${methodName} 时出错:`, e); }
       continue;
     }
@@ -337,11 +338,70 @@ function assembleAndExecuteFunctions(staticCalls, functionDefs, dependencies, cl
     if (!target || typeof target[methodName] !== 'function') { console.warn(`对象/实例 ${objName} 没有方法 ${methodName}，跳过执行`); continue; }
     try {
       const result = target[methodName](...args);
-      results.push({ function: `${objName}.${methodName}`, arguments: args, result });
+      results.push({callAst, function: `${objName}.${methodName}`, arguments: args, result });
     } catch (e) { console.error(`执行 ${objName}.${methodName} 时出错:`, e); }
   }
 
   return results;
+}
+
+
+
+// 辅助函数：将JavaScript值转换为AST节点
+function valueToAstNode(value) {
+  if (value === null) {
+    return { type: 'NullLiteral' };
+  }
+  
+  if (value === undefined) {
+    return { type: 'Identifier', name: 'undefined' };
+  }
+  
+  switch (typeof value) {
+    case 'string':
+      return { type: 'StringLiteral', value: value };
+    
+    case 'number':
+      if (Number.isNaN(value)) {
+        return { type: 'Identifier', name: 'NaN' };
+      }
+      if (!Number.isFinite(value)) {
+        return value > 0 
+          ? { type: 'Identifier', name: 'Infinity' }
+          : { type: 'UnaryExpression', operator: '-', argument: { type: 'Identifier', name: 'Infinity' } };
+      }
+      return { type: 'NumericLiteral', value: value };
+    
+    case 'boolean':
+      return { type: 'BooleanLiteral', value: value };
+    
+    case 'object':
+      if (Array.isArray(value)) {
+        return {
+          type: 'ArrayExpression',
+          elements: value.map(item => valueToAstNode(item))
+        };
+      }
+      
+      // 普通对象
+      const properties = Object.keys(value).map(key => ({
+        type: 'ObjectProperty',
+        key: { type: 'Identifier', name: key },
+        value: valueToAstNode(value[key]),
+        computed: false,
+        shorthand: false
+      }));
+      
+      return {
+        type: 'ObjectExpression',
+        properties: properties
+      };
+    
+    default:
+      // 对于函数、Symbol等复杂类型，返回注释节点
+      console.warn(`无法将类型 ${typeof value} 转换为AST节点，保留原调用`);
+      return null;
+  }
 }
 
 // 主函数
@@ -357,11 +417,28 @@ function main() {
     process.exit(1);
   }
   console.log(`分析文件: ${filePath}`);
-  const { staticCalls, functionDefs, classDefs, varDefs, dependencies } = extractStaticFunctionCalls(filePath);
+  const {ast, staticCalls, functionDefs, classDefs, varDefs, dependencies } = extractStaticFunctionCalls(filePath);
   console.log(`找到 ${staticCalls.length} 个静态函数调用`);
   const results = assembleAndExecuteFunctions(staticCalls, functionDefs, dependencies, classDefs, varDefs);
   console.log('\n执行结果:');
-  console.log(JSON.stringify(results, null, 2));
+  // console.log(JSON.stringify(results, null, 2));
+
+  //替换静态函数调用为结果
+ 
+  results.forEach((result, index) => {
+    const callAst = result.callAst;
+    const resultNode = valueToAstNode(result.result);
+    if (resultNode) {
+      const fnString = callAst.toString();
+      callAst.replaceWith(resultNode);
+      console.log('替换成功:',fnString, "=>", callAst.toString());
+    }
+  });
+  const { code } = generate(ast);
+
+  // 保存到文件
+  fs.writeFileSync(filePath+'.clear.js', code);
+  
 }
 
 // 执行主函数
@@ -380,7 +457,7 @@ module.exports = {
 // 简化的依赖分析占位：当前不使用具体依赖关系
 function analyzeFunctionDependencies(ast, staticCalls) {
   const m = new Map();
-  staticCalls.forEach(call => m.set(call, new Set()));
+  staticCalls.forEach(call => m.set(call.node, new Set()));
   return m;
 }
 
