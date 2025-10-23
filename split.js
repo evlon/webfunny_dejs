@@ -374,7 +374,7 @@ function generateControllerModule(controllerInfo, analysis) {
     referencedControllers.forEach(refName => {
 
       // 首字母小写
-      const modulePath = refName.replace(/^\w/,(str)=>str.toLowerCase());
+      const modulePath = `./${refName.replace(/^\w/,(str)=>str.toLowerCase())}`;
 
       // const modulePath = `./${refName.toLowerCase()}`;
       content += `const ${refName} = require('${modulePath}').${refName};\n`;
