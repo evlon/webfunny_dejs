@@ -437,7 +437,7 @@ function main() {
   const { code } = generate(ast);
 
   // 保存到文件
-  fs.writeFileSync(filePath+'.clear.js', code);
+  fs.writeFileSync(filePath, code);
   
 }
 
